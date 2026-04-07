@@ -3,6 +3,7 @@ const { getPersonaVoice, getMessageById } = require('./memoryRepository');
 const { splitIntoSentences } = require('./messageAssembler');
 const { buildVoiceConfig, DEFAULT_LANGUAGE } = require('./voice');
 const { warn } = require('./logger');
+const { normalizeLanguageCode } = require('./languageSupport');
 
 const handleTtsRequest = async ({ session, user }, payload, sendEvent) => {
   const messageId = payload?.messageId;
@@ -32,11 +33,15 @@ const handleTtsRequest = async ({ session, user }, payload, sendEvent) => {
   }
 
   try {
+    const playbackLanguage = normalizeLanguageCode(
+      message.content?.metadata?.languageCode || session.language,
+      DEFAULT_LANGUAGE
+    );
     const personaVoice = await getPersonaVoice(
       session.personaId,
-      session.language || DEFAULT_LANGUAGE
+      playbackLanguage
     );
-    const voiceConfig = buildVoiceConfig(personaVoice, session.language || DEFAULT_LANGUAGE);
+    const voiceConfig = buildVoiceConfig(personaVoice, playbackLanguage);
     const sentences = splitIntoSentences(text);
 
     if (!sentences.length) {
@@ -54,7 +59,7 @@ const handleTtsRequest = async ({ session, user }, payload, sendEvent) => {
       await enqueueSentence({
         sessionId: session.id,
         personaId: session.personaId,
-        language: session.language || DEFAULT_LANGUAGE,
+        language: playbackLanguage,
         text: sentence,
         voiceConfig,
         sendEvent: emit,

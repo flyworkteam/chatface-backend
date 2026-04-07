@@ -53,9 +53,10 @@ const getPersonaById = async (personaId) => {
 
 const getPersonaVoice = async (personaId, language) => {
   const [rows] = await pool.execute(
-    `SELECT persona_id, language_code, elevenlabs_voice_id, style, timbre, lip_sync_preset
+    `SELECT persona_id, language_code, elevenlabs_voice_id, style, timbre, lip_sync_preset, sample_rate
      FROM persona_voices
-     WHERE persona_id = ? AND language_code = ?
+     WHERE persona_id = ?
+     ORDER BY CASE WHEN language_code = ? THEN 0 ELSE 1 END, language_code ASC
      LIMIT 1`,
     [personaId, language]
   );

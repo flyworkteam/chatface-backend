@@ -1,5 +1,5 @@
 const { enqueueSentence } = require('./ttsPipeline');
-const { log, warn } = require('./logger');
+const { debug, warn } = require('./logger');
 
 /**
  * Thinking filler phrases per language.
@@ -45,7 +45,7 @@ const playThinkingVoice = async ({
   const thinkingPlaybackId = `thinking-${session.id}-${Date.now()}`;
   const sequence = `thinking-${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
-  log('Playing thinking voice', {
+  debug('Playing thinking voice', {
     sessionId: session.id,
     language,
     phrase,

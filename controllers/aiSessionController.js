@@ -3,15 +3,15 @@ const { v4: uuidv4 } = require('uuid');
 const sharp = require('sharp');
 const { uploadBuffer } = require('../utils/bunny');
 const { fetchCachedAudioByKey } = require('../services/ai/ttsCacheService');
+const {
+  SUPPORTED_SESSION_LANGUAGES,
+  normalizeLanguageCode
+} = require('../services/ai/languageSupport');
 
 const MAX_ATTACHMENT_UPLOAD_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION = 1536;
 const THUMBNAIL_DIMENSION = 512;
 const SUPPORTED_PERSONA_GENDERS = new Set(['male', 'female']);
-const SUPPORTED_SESSION_LANGUAGES = new Set([
-  'en', 'tr', 'es', 'fr', 'de', 'pt', 'it', 'ar', 'ja', 'ko', 'zh', 'ru'
-]);
-
 const stripInlineFromAttachments = (attachments = []) => {
   if (!Array.isArray(attachments)) {
     return [];
@@ -120,15 +120,6 @@ const ensureSessionOwnership = async ({ sessionId, userId }) => {
   );
 
   return rows[0] || null;
-};
-
-const normalizeLanguageCode = (value) => {
-  if (typeof value !== 'string') {
-    return null;
-  }
-
-  const normalized = value.trim().toLowerCase();
-  return normalized || null;
 };
 
 const parseBooleanQuery = (value) => {

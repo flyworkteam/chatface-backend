@@ -7,11 +7,14 @@ const {
 } = require('./memoryRepository');
 const { reviewText } = require('./moderationService');
 const { enqueueSentence } = require('./ttsPipeline');
-const { streamChatCompletion } = require('./geminiAdapter');
-const { warn, log } = require('./logger');
+const { streamChatCompletion } = require('./openaiAdapter');
+const { warn, log, debug } = require('./logger');
 const { buildVoiceConfig, DEFAULT_LANGUAGE } = require('./voice');
 const { playThinkingVoice } = require('./thinkingVoices');
 const { findEchoMatch, isAssistantSpeechActive } = require('./echoGuard');
+const { updateSessionLanguage } = require('./sessionService');
+const { resolveUserLanguage, validateTranscript } = require('./languageResolution');
+const { normalizeLanguageCode } = require('./languageSupport');
 
 const VALID_CONVERSATION_TYPES = new Set(['chat', 'voice_call', 'video_call']);
 const VALID_CONVERSATION_STATUSES = new Set(['active', 'ended']);
@@ -128,6 +131,8 @@ const handleUserMessage = async (
   const metadata = {
     ...options.metadata
   };
+  const sessionMode = session.mode || 'chat';
+  const isLockedCallLanguage = isVoiceMode(sessionMode);
 
   const defaultMode = normalizeSessionMode(session.mode);
   const { conversationType, conversationStatus } = resolveConversationMetadata({
@@ -187,6 +192,48 @@ const handleUserMessage = async (
     }
   }
 
+  const sessionLanguage = normalizeLanguageCode(session.language, DEFAULT_LANGUAGE);
+  const languageResolution = isLockedCallLanguage
+    ? {
+        language: sessionLanguage,
+        confidence: 1,
+        source: 'manual_lock',
+        shouldSwitch: false
+      }
+    : text
+      ? resolveUserLanguage({ text, currentLanguage: sessionLanguage })
+      : {
+          language: sessionLanguage,
+          confidence: 0,
+          source: 'fallback',
+          shouldSwitch: false
+        };
+  const resolvedLanguage = normalizeLanguageCode(languageResolution.language, sessionLanguage);
+  const shouldPersistLanguage = !isLockedCallLanguage && resolvedLanguage && resolvedLanguage !== sessionLanguage;
+
+  if (resolvedLanguage) {
+    metadata.languageCode = resolvedLanguage;
+    metadata.languageConfidence = languageResolution.confidence;
+    metadata.languageSource = languageResolution.source;
+  }
+
+  if (shouldPersistLanguage) {
+    await updateSessionLanguage(session.id, resolvedLanguage);
+    session.language = resolvedLanguage;
+    sendEvent('language_updated', {
+      language: resolvedLanguage,
+      sessionId: session.id
+    });
+    log('Session conversation language updated', {
+      sessionId: session.id,
+      userId: user.id,
+      from: sessionLanguage,
+      to: resolvedLanguage,
+      source: languageResolution.source,
+      confidence: languageResolution.confidence
+    });
+  }
+
   await saveMessage({
     sessionId: session.id,
     role: 'user',
@@ -196,8 +243,7 @@ const handleUserMessage = async (
   sendEvent('ack', { messageId: payload.clientMessageId });
   sendEvent('typing', { state: 'assistant' });
 
-  const sessionLanguage = session.language || DEFAULT_LANGUAGE;
-  const sessionMode = session.mode || 'chat';
+  const activeLanguage = normalizeLanguageCode(session.language, DEFAULT_LANGUAGE);
   const shouldAutoTts = isVoiceMode(sessionMode);
 
   // Run context build + persona voice lookup in parallel
@@ -205,12 +251,13 @@ const handleUserMessage = async (
     buildContext({
       sessionId: session.id,
       personaId: session.personaId,
-      mode: sessionMode
+      mode: sessionMode,
+      conversationLanguage: activeLanguage
     }),
-    getPersonaVoice(session.personaId, sessionLanguage)
+    getPersonaVoice(session.personaId, activeLanguage)
   ]);
 
-  const voiceConfig = buildVoiceConfig(personaVoice, sessionLanguage);
+  const voiceConfig = buildVoiceConfig(personaVoice, activeLanguage);
   const responsePlaybackId = shouldAutoTts
     ? `${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     : null;
@@ -220,7 +267,7 @@ const handleUserMessage = async (
     playThinkingVoice({
       session,
       personaId: session.personaId,
-      language: sessionLanguage,
+      language: activeLanguage,
       voiceConfig,
       sendEvent,
       userId: user.id
@@ -234,7 +281,7 @@ const handleUserMessage = async (
         enqueueSentence({
           sessionId: session.id,
           personaId: session.personaId,
-          language: sessionLanguage,
+          language: activeLanguage,
           text: sentence,
           voiceConfig,
           sendEvent,
@@ -386,7 +433,7 @@ const handleSttTranscript = async ({ session, user }, payload, sendEvent) => {
   });
 
   if (!isFinal) {
-    log('STT partial forwarded to client', {
+    debug('STT partial forwarded to client', {
       sessionId: session.id,
       transcriptId,
       textPreview: preview
@@ -398,6 +445,34 @@ const handleSttTranscript = async ({ session, user }, payload, sendEvent) => {
     return;
   }
 
+  const validation = validateTranscript({
+    text,
+    metadata: payload.metadata,
+    currentLanguage: session.language,
+    lockedLanguage: isVoiceMode(session.mode) ? session.language : null
+  });
+
+  if (!validation.accepted) {
+    log('STT final suppressed after validation', {
+      sessionId: session.id,
+      userId: user.id,
+      transcriptId,
+      textPreview: preview,
+      reason: validation.reason,
+      confidence: validation.confidence,
+      resolvedLanguage: validation.resolution?.language
+    });
+    sendEvent('stt_partial', {
+      transcriptId,
+      text: '',
+      metadata: {
+        suppressed: true,
+        reason: validation.reason
+      }
+    });
+    return;
+  }
+
   log('STT final promoted to user message', {
     sessionId: session.id,
     transcriptId,
@@ -405,9 +480,14 @@ const handleSttTranscript = async ({ session, user }, payload, sendEvent) => {
   });
 
   const metadata = { ...(payload.metadata || {}) };
-  metadata.source = metadata.source || (metadata.whisper ? 'whisper' : 'stt');
-  if (typeof metadata.confidence === 'undefined' && metadata.whisper?.confidence !== undefined) {
-    metadata.confidence = metadata.whisper.confidence;
+  metadata.source = metadata.source || (metadata.openaiStt ? 'openai_stt' : 'stt');
+  if (typeof metadata.confidence === 'undefined' && metadata.openaiStt?.confidence !== undefined) {
+    metadata.confidence = metadata.openaiStt.confidence;
+  }
+  if (validation.resolution?.language) {
+    metadata.languageCode = validation.resolution.language;
+    metadata.languageConfidence = validation.resolution.confidence;
+    metadata.languageSource = validation.resolution.source;
   }
 
   await handleUserMessage(

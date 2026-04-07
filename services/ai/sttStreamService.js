@@ -11,6 +11,7 @@ const {
   STT_ALLOW_LOCAL_FALLBACK
 } = require('../../config/stt');
 const { log, warn } = require('./logger');
+const { normalizeLanguageCode } = require('./languageSupport');
 const {
   hasSessionSttBudget,
   incrementSessionSttUsage,
@@ -21,6 +22,7 @@ const {
 const REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(STT_REALTIME_MODEL)}`;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const DEFAULT_ENCODING = 'pcm16';
+const MIN_COMMIT_AUDIO_MS = 100;
 const PROTOCOLS = ['realtime'];
 const HEADERS = {
   'OpenAI-Beta': 'realtime=v1'
@@ -133,14 +135,17 @@ const configureTranscriptionSession = (controller) => {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     return;
   }
+  const transcriptionConfig = {
+    model: STT_TRANSCRIBE_MODEL
+  };
+  if (languageHint) {
+    transcriptionConfig.language = languageHint;
+  }
   const payload = {
     type: resolveSessionUpdateEventType(),
     session: {
       input_audio_format: encoding,
-      input_audio_transcription: {
-        model: STT_TRANSCRIBE_MODEL,
-        language: languageHint
-      },
+      input_audio_transcription: transcriptionConfig,
       turn_detection: {
         type: 'server_vad',
         silence_duration_ms: STT_MAX_LAG_MS,
@@ -186,10 +191,12 @@ const handleTranscriptionComplete = async (controller, event) => {
   transcript.text = event.transcript?.trim() || transcript.text;
   const latencyMs = Date.now() - (transcript.startedAt || controller.startedAt || Date.now());
   const metadata = {
-    source: 'whisper',
+    source: 'openai_stt',
     latencyMs,
-    whisper: {
+    openaiStt: {
       itemId: event.item_id,
+      realtimeModel: STT_REALTIME_MODEL,
+      transcriptionModel: STT_TRANSCRIBE_MODEL,
       usage: event.usage,
       confidence: computeConfidence(event.logprobs),
       logprobs: event.logprobs
@@ -211,7 +218,7 @@ const handleTranscriptionComplete = async (controller, event) => {
       metadata
     });
   } catch (err) {
-    warn('Failed to forward Whisper transcript', err?.message);
+    warn('Failed to forward OpenAI transcript', err?.message);
   } finally {
     controller.transcripts.delete(event.item_id);
   }
@@ -356,6 +363,7 @@ const appendChunk = (controller, payload) => {
 
   incrementSessionSttUsage(controller.sessionId, durationMs);
   controller.bufferedMs += durationMs;
+  controller.pendingCommitMs += durationMs;
   controller.socket.send(
     JSON.stringify({
       type: 'input_audio_buffer.append',
@@ -384,7 +392,11 @@ const commitBuffer = (controller) => {
   if (!controller.socket || controller.socket.readyState !== WebSocket.OPEN) {
     return;
   }
+  if (controller.pendingCommitMs < MIN_COMMIT_AUDIO_MS) {
+    return;
+  }
   controller.socket.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+  controller.pendingCommitMs = 0;
 };
 
 const startStream = async ({ session, user, sendEvent, onTranscript }, options = {}) => {
@@ -426,11 +438,12 @@ const startStream = async ({ session, user, sendEvent, onTranscript }, options =
     onTranscript,
     transcripts: new Map(),
     bufferedMs: 0,
+    pendingCommitMs: 0,
     reconnectAttempts: 0,
     destroyed: false,
     idleTimer: null,
     startedAt: Date.now(),
-    languageHint: session.language || options.language,
+    languageHint: normalizeLanguageCode(session.language || options.language),
     socket: null
   };
 

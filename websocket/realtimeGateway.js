@@ -9,7 +9,11 @@ const {
 const { handleTtsRequest } = require('../services/ai/ttsRequestService');
 const sttStreamService = require('../services/ai/sttStreamService');
 const { clearSessionSpeech } = require('../services/ai/echoGuard');
-const { log, warn } = require('../services/ai/logger');
+const { debug, log, warn } = require('../services/ai/logger');
+const {
+  SUPPORTED_SESSION_LANGUAGES,
+  normalizeLanguageCode
+} = require('../services/ai/languageSupport');
 
 const HEARTBEAT_INTERVAL = 20000;
 const PREVIEW_LIMIT = 90;
@@ -84,7 +88,9 @@ const initializeRealtimeGateway = (server) => {
     ws.on('message', async (raw, isBinary) => {
       try {
         const payload = parseIncomingPayload(raw, isBinary);
-        log('Realtime inbound event', {
+        const shouldLogInboundEvent = !['stt_audio_chunk', 'ping', 'pong'].includes(payload.type);
+        const logger = shouldLogInboundEvent ? log : debug;
+        logger('Realtime inbound event', {
           sessionId: session.id,
           userId: user.id,
           type: payload.type,
@@ -198,7 +204,7 @@ const routeIncomingEvent = async (ws, payload) => {
     case 'ping':
       // Some legacy clients still emit JSON-level "ping" events instead of "pong".
       // Treat them as a heartbeat to avoid spurious errors/noise and reply explicitly.
-      log('Realtime JSON ping received', {
+      debug('Realtime JSON ping received', {
         sessionId: ws.context.session.id,
         userId: ws.context.user.id,
         ts: payload?.ts
@@ -214,18 +220,14 @@ const routeIncomingEvent = async (ws, payload) => {
   }
 };
 
-const SUPPORTED_LANGUAGES = new Set([
-  'en', 'tr', 'es', 'fr', 'de', 'pt', 'it', 'ar', 'ja', 'ko', 'zh', 'ru'
-]);
-
 const handleLanguageUpdate = async (ws, payload, sendEvent) => {
   const { session, user } = ws.context;
-  const languageCode = (payload.language || '').trim().toLowerCase();
+  const languageCode = normalizeLanguageCode(payload.language);
 
-  if (!languageCode || !SUPPORTED_LANGUAGES.has(languageCode)) {
+  if (!languageCode || !SUPPORTED_SESSION_LANGUAGES.has(languageCode)) {
     sendEvent('error', {
       type: 'invalid_language',
-      message: `Unsupported language: ${languageCode}. Supported: ${[...SUPPORTED_LANGUAGES].join(', ')}`
+      message: `Unsupported language: ${languageCode}. Supported: ${[...SUPPORTED_SESSION_LANGUAGES].join(', ')}`
     });
     return;
   }

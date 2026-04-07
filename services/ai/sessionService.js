@@ -1,4 +1,5 @@
 const { pool } = require('../../config/database');
+const { normalizeLanguageCode } = require('./languageSupport');
 
 const getSessionById = async (sessionId) => {
   const [rows] = await pool.execute(
@@ -28,9 +29,13 @@ const touchSession = async (sessionId) => {
 };
 
 const updateSessionLanguage = async (sessionId, languageCode) => {
+  const normalizedLanguage = normalizeLanguageCode(languageCode);
+  if (!normalizedLanguage) {
+    return;
+  }
   await pool.execute(
     `UPDATE ai_sessions SET language_code = ?, last_seen_at = NOW() WHERE id = ?`,
-    [languageCode, sessionId]
+    [normalizedLanguage, sessionId]
   );
 };
 
