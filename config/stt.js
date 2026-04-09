@@ -4,6 +4,7 @@ const DEFAULTS = {
   sampleRate: 16000,
   chunkMs: 200,
   maxLagMs: 1200,
+  idleTimeoutMs: 6000,
   partialThrottleMs: 150,
   sessionMinuteLimit: 15
 };
@@ -14,6 +15,10 @@ const STT_TRANSCRIBE_MODEL = process.env.STT_TRANSCRIBE_MODEL || DEFAULTS.transc
 const STT_SAMPLE_RATE = parseInt(process.env.STT_SAMPLE_RATE || DEFAULTS.sampleRate, 10);
 const STT_CHUNK_MS = parseInt(process.env.STT_CHUNK_MS || DEFAULTS.chunkMs, 10);
 const STT_MAX_LAG_MS = parseInt(process.env.STT_MAX_LAG_MS || DEFAULTS.maxLagMs, 10);
+const STT_IDLE_TIMEOUT_MS = parseInt(
+  process.env.STT_IDLE_TIMEOUT_MS || DEFAULTS.idleTimeoutMs,
+  10
+);
 const STT_PARTIAL_THROTTLE_MS = parseInt(
   process.env.STT_PARTIAL_THROTTLE_MS || DEFAULTS.partialThrottleMs,
   10
@@ -32,6 +37,7 @@ module.exports = {
   STT_SAMPLE_RATE,
   STT_CHUNK_MS,
   STT_MAX_LAG_MS,
+  STT_IDLE_TIMEOUT_MS,
   STT_PARTIAL_THROTTLE_MS,
   STT_STREAM_ENABLED,
   STT_ALLOW_LOCAL_FALLBACK,

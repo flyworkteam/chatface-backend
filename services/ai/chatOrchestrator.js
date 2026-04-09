@@ -10,7 +10,7 @@ const { enqueueSentence } = require('./ttsPipeline');
 const { streamChatCompletion } = require('./openaiAdapter');
 const { warn, log, debug } = require('./logger');
 const { buildVoiceConfig, DEFAULT_LANGUAGE } = require('./voice');
-const { playThinkingVoice } = require('./thinkingVoices');
+const { scheduleThinkingVoice, cancelThinkingVoice } = require('./thinkingVoices');
 const { findEchoMatch, isAssistantSpeechActive } = require('./echoGuard');
 const { updateSessionLanguage } = require('./sessionService');
 const { resolveUserLanguage, validateTranscript } = require('./languageResolution');
@@ -120,6 +120,12 @@ const previewText = (text, limit = 120) => {
   return normalized.length > limit ? `${normalized.slice(0, limit)}…` : normalized;
 };
 
+const queueBackgroundTask = (label, task) => {
+  Promise.resolve()
+    .then(task)
+    .catch((error) => warn(label, error.message));
+};
+
 const handleUserMessage = async (
   { session, user },
   payload,
@@ -161,6 +167,8 @@ const handleUserMessage = async (
     metadata.transcriptId = options.transcriptId;
   }
 
+  sendEvent('ack', { messageId: payload.clientMessageId });
+
   if (isConversationEndEvent) {
     const endText = getConversationEndText(conversationType);
     const savedMarker = await saveMessage({
@@ -173,7 +181,6 @@ const handleUserMessage = async (
       }
     });
 
-    sendEvent('ack', { messageId: payload.clientMessageId });
     sendEvent('conversation_marker', {
       messageId: savedMarker.id,
       sessionId: session.id,
@@ -182,14 +189,6 @@ const handleUserMessage = async (
       metadata
     });
     return;
-  }
-
-  if (text) {
-    const moderationResult = await reviewText(text);
-    if (moderationResult.blocked) {
-      sendEvent('error', { type: 'moderation', message: 'Message blocked' });
-      return;
-    }
   }
 
   const sessionLanguage = normalizeLanguageCode(session.language, DEFAULT_LANGUAGE);
@@ -234,56 +233,73 @@ const handleUserMessage = async (
     });
   }
 
-  await saveMessage({
-    sessionId: session.id,
-    role: 'user',
-    content: { text, metadata, attachments }
-  });
-
-  sendEvent('ack', { messageId: payload.clientMessageId });
   sendEvent('typing', { state: 'assistant' });
 
   const activeLanguage = normalizeLanguageCode(session.language, DEFAULT_LANGUAGE);
   const shouldAutoTts = isVoiceMode(sessionMode);
+  const userContent = { text, metadata, attachments };
+  const moderationPromise = text
+    ? reviewText(text)
+    : Promise.resolve({ blocked: false });
 
-  // Run context build + persona voice lookup in parallel
-  const [context, personaVoice] = await Promise.all([
+  const [moderationResult, context, personaVoice] = await Promise.all([
+    moderationPromise,
     buildContext({
       sessionId: session.id,
       personaId: session.personaId,
       mode: sessionMode,
-      conversationLanguage: activeLanguage
+      conversationLanguage: activeLanguage,
+      pendingMessages: [{ role: 'user', content: userContent }]
     }),
-    getPersonaVoice(session.personaId, activeLanguage)
+    shouldAutoTts
+      ? getPersonaVoice(session.personaId, activeLanguage)
+      : Promise.resolve(null)
   ]);
 
-  const voiceConfig = buildVoiceConfig(personaVoice, activeLanguage);
+  if (moderationResult.blocked) {
+    sendEvent('error', { type: 'moderation', message: 'Message blocked' });
+    return;
+  }
+
+  queueBackgroundTask('Failed to persist user message', async () => {
+    await saveMessage({
+      sessionId: session.id,
+      role: 'user',
+      content: userContent
+    });
+  });
+
+  const voiceConfig = shouldAutoTts
+    ? buildVoiceConfig(personaVoice, activeLanguage)
+    : null;
   const responsePlaybackId = shouldAutoTts
     ? `${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     : null;
 
-  // Fire thinking voice while LLM is generating (non-blocking)
   if (shouldAutoTts) {
-    playThinkingVoice({
+    queueBackgroundTask('Thinking voice failed', async () => {
+      scheduleThinkingVoice({
       session,
       personaId: session.personaId,
       language: activeLanguage,
-      voiceConfig,
+      voiceConfig: voiceConfig,
       sendEvent,
       userId: user.id
-    }).catch((err) => warn('Thinking voice failed', err.message));
+      });
+    });
   }
 
   const assembler = shouldAutoTts
     ? new SentenceAssembler({
       onSentenceComplete: (sentence) => {
+        cancelThinkingVoice(session.id, sendEvent);
         const sequence = `${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         enqueueSentence({
           sessionId: session.id,
           personaId: session.personaId,
           language: activeLanguage,
           text: sentence,
-          voiceConfig,
+          voiceConfig: voiceConfig,
           sendEvent,
           userId: user.id,
           sequence,
@@ -294,6 +310,7 @@ const handleUserMessage = async (
     : null;
 
   const startedAt = Date.now();
+  let emittedFirstDelta = false;
 
   try {
     const llmResult = await streamChatCompletion({
@@ -302,6 +319,15 @@ const handleUserMessage = async (
       mode: sessionMode,
       onDelta: (delta) => {
         if (delta) {
+          if (!emittedFirstDelta) {
+            emittedFirstDelta = true;
+            cancelThinkingVoice(session.id, sendEvent);
+            log('First assistant delta emitted', {
+              sessionId: session.id,
+              userId: user.id,
+              latencyMs: Date.now() - startedAt
+            });
+          }
           sendEvent('assistant_delta', { delta });
           if (assembler) {
             assembler.append(delta);
@@ -313,6 +339,7 @@ const handleUserMessage = async (
     if (assembler) {
       assembler.flush();
     }
+    cancelThinkingVoice(session.id, sendEvent);
 
     const latencyMs = Date.now() - startedAt;
 
@@ -323,23 +350,25 @@ const handleUserMessage = async (
     });
 
     // Fire-and-forget: save message + record usage in background
-    Promise.all([
-      saveMessage({
-        sessionId: session.id,
-        role: 'assistant',
-        content: { text: llmResult.fullText }
-      }),
-      recordUsage({
-        sessionId: session.id,
-        userId: user.id,
-        llmIn: Math.round(llmResult.tokensIn),
-        llmOut: Math.round(llmResult.tokensOut),
-        ttsChars: llmResult.fullText.length,
-        latencyMs
-      })
-    ]).catch((err) => warn('Background save failed', err.message));
-
+    queueBackgroundTask('Background assistant persistence failed', async () => {
+      await Promise.all([
+        saveMessage({
+          sessionId: session.id,
+          role: 'assistant',
+          content: { text: llmResult.fullText }
+        }),
+        recordUsage({
+          sessionId: session.id,
+          userId: user.id,
+          llmIn: Math.round(llmResult.tokensIn),
+          llmOut: Math.round(llmResult.tokensOut),
+          ttsChars: llmResult.fullText.length,
+          latencyMs
+        })
+      ]);
+    });
   } catch (error) {
+    cancelThinkingVoice(session.id, sendEvent);
     warn('Chat orchestrator failed', error.message);
     sendEvent('error', { type: 'llm_error', message: error.message });
   }

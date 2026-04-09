@@ -1,4 +1,3 @@
-const url = require('url');
 const WebSocket = require('ws');
 const { verifyToken } = require('../utils/jwt');
 const { getSessionById, touchSession, updateSessionLanguage } = require('../services/ai/sessionService');
@@ -17,6 +16,8 @@ const {
 
 const HEARTBEAT_INTERVAL = 20000;
 const PREVIEW_LIMIT = 90;
+const STT_TRANSPORTS = new Set(['json', 'binary']);
+const TTS_PAYLOADS = new Set(['url', 'inline', 'both']);
 
 const previewText = (text) => {
   if (!text) {
@@ -33,7 +34,9 @@ const initializeRealtimeGateway = (server) => {
   const wss = new WebSocket.Server({ noServer: true });
 
   server.on('upgrade', async (request, socket, head) => {
-    const { pathname, query } = url.parse(request.url, true);
+    const parsedUrl = new URL(request.url, 'http://localhost');
+    const pathname = parsedUrl.pathname;
+    const query = Object.fromEntries(parsedUrl.searchParams.entries());
 
     if (pathname !== '/realtime') {
       socket.destroy();
@@ -55,6 +58,10 @@ const initializeRealtimeGateway = (server) => {
 
       request.user = decoded;
       request.session = session;
+      request.capabilities = {
+        sttTransport: resolveSttTransport(query?.sttTransport),
+        ttsPayload: resolveTtsPayload(query?.ttsPayload)
+      };
 
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
@@ -66,8 +73,8 @@ const initializeRealtimeGateway = (server) => {
   });
 
   wss.on('connection', (ws, request) => {
-    const { session, user } = request;
-    ws.context = { session, user };
+    const { session, user, capabilities } = request;
+    ws.context = { session, user, capabilities };
     ws.isAlive = true;
 
     touchSession(session.id).catch((error) => warn('Failed to touch session', error.message));
@@ -77,7 +84,8 @@ const initializeRealtimeGateway = (server) => {
       JSON.stringify({
         type: 'session_ready',
         sessionId: session.id,
-        personaId: session.personaId
+        personaId: session.personaId,
+        capabilities
       })
     );
 
@@ -145,7 +153,8 @@ const routeIncomingEvent = async (ws, payload) => {
       delete payload.type;
     }
 
-    ws.send(JSON.stringify({ type, ...payload }));
+    const outgoing = shapeOutgoingEvent(type, payload, ws.context?.capabilities);
+    ws.send(JSON.stringify({ type, ...outgoing }));
   };
 
   switch (payload.type) {
@@ -283,6 +292,32 @@ const parseIncomingPayload = (raw, isBinary) => {
   }
 
   return JSON.parse(raw?.toString?.() || '{}');
+};
+
+const resolveSttTransport = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  return STT_TRANSPORTS.has(normalized) ? normalized : 'json';
+};
+
+const resolveTtsPayload = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  return TTS_PAYLOADS.has(normalized) ? normalized : 'both';
+};
+
+const shapeOutgoingEvent = (type, payload, capabilities = {}) => {
+  if (type !== 'tts_chunk') {
+    return payload;
+  }
+
+  const shaped = { ...payload };
+  const ttsPayload = resolveTtsPayload(capabilities.ttsPayload);
+  if (ttsPayload === 'url' && shaped.audioUrl) {
+    delete shaped.audio;
+  } else if (ttsPayload === 'inline' && shaped.audio) {
+    delete shaped.audioUrl;
+  }
+
+  return shaped;
 };
 
 module.exports = {

@@ -6,6 +6,7 @@ const {
   STT_TRANSCRIBE_MODEL,
   STT_SAMPLE_RATE,
   STT_MAX_LAG_MS,
+  STT_IDLE_TIMEOUT_MS,
   STT_PARTIAL_THROTTLE_MS,
   STT_STREAM_ENABLED,
   STT_ALLOW_LOCAL_FALLBACK
@@ -345,7 +346,7 @@ const resetIdleTimer = (controller) => {
   controller.idleTimer = setTimeout(() => {
     sendSttError(controller, 'Streaming audio idle timeout.');
     destroyController(controller, 'idle_timeout');
-  }, STT_MAX_LAG_MS);
+  }, STT_IDLE_TIMEOUT_MS);
   controller.idleTimer.unref?.();
 };
 
@@ -360,9 +361,24 @@ const appendChunk = (controller, payload) => {
     return false;
   }
   const durationMs = estimateDurationMs(normalized.byteLength, controller.sampleRate, controller.encoding);
+  if (!hasSessionSttBudget(controller.sessionId, durationMs)) {
+    sendSttError(controller, 'Streaming STT quota exceeded for this session.', summarizeQuota(controller.sessionId));
+    return false;
+  }
+
+  const now = Date.now();
+  const wallClockElapsed = now - controller.startedAt;
+  const projectedBufferedMs = controller.bufferedMs + durationMs;
+  const aheadMs = projectedBufferedMs - wallClockElapsed;
+  if (aheadMs > STT_MAX_LAG_MS) {
+    sendSttError(controller, 'Audio chunks are arriving too quickly. Dropping latest chunk.', {
+      aheadMs
+    });
+    return false;
+  }
 
   incrementSessionSttUsage(controller.sessionId, durationMs);
-  controller.bufferedMs += durationMs;
+  controller.bufferedMs = projectedBufferedMs;
   controller.pendingCommitMs += durationMs;
   controller.socket.send(
     JSON.stringify({
@@ -371,16 +387,6 @@ const appendChunk = (controller, payload) => {
     })
   );
   resetIdleTimer(controller);
-
-  const now = Date.now();
-  const wallClockElapsed = now - controller.startedAt;
-  const aheadMs = controller.bufferedMs - wallClockElapsed;
-  if (aheadMs > STT_MAX_LAG_MS) {
-    sendSttError(controller, 'Audio chunks are arriving too quickly. Dropping latest chunk.', {
-      aheadMs
-    });
-    return false;
-  }
 
   if (payload?.vad === 'stop' || payload?.isFinal) {
     commitBuffer(controller);

@@ -1,6 +1,6 @@
 const { enqueueSentence } = require('./ttsPipeline');
 const { getPersonaVoice, getMessageById } = require('./memoryRepository');
-const { splitIntoSentences } = require('./messageAssembler');
+const { splitIntoSpeechChunks } = require('./messageAssembler');
 const { buildVoiceConfig, DEFAULT_LANGUAGE } = require('./voice');
 const { warn } = require('./logger');
 const { normalizeLanguageCode } = require('./languageSupport');
@@ -42,7 +42,7 @@ const handleTtsRequest = async ({ session, user }, payload, sendEvent) => {
       playbackLanguage
     );
     const voiceConfig = buildVoiceConfig(personaVoice, playbackLanguage);
-    const sentences = splitIntoSentences(text);
+    const sentences = splitIntoSpeechChunks(text);
 
     if (!sentences.length) {
       sendEvent('error', { type: 'no_sentences', messageId });

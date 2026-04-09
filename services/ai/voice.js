@@ -1,18 +1,45 @@
 const DEFAULT_LANGUAGE = process.env.DEFAULT_AI_LANGUAGE || 'en';
 
+const parseOptionalFloat = (value) => {
+  const numeric = Number.parseFloat(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
+};
+
+const parseOptionalBoolean = (value) => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].includes(normalized)) {
+      return true;
+    }
+    if (['false', '0', 'no', 'off'].includes(normalized)) {
+      return false;
+    }
+  }
+  return undefined;
+};
+
 const buildVoiceConfig = (voiceRow, language = DEFAULT_LANGUAGE) => {
   const voiceId = voiceRow?.elevenlabs_voice_id || process.env.ELEVENLABS_DEFAULT_VOICE;
   if (!voiceId) {
     throw new Error('No ElevenLabs voice configured for persona');
   }
 
+  const settings = {
+    stability: parseOptionalFloat(voiceRow?.stability),
+    similarity_boost: parseOptionalFloat(voiceRow?.similarity_boost),
+    style: parseOptionalFloat(voiceRow?.style),
+    use_speaker_boost: parseOptionalBoolean(voiceRow?.use_speaker_boost)
+  };
+
   return {
     voiceId,
     language,
-    settings: {
-      stability: parseFloat(voiceRow?.stability ?? '0.5'),
-      style: parseFloat(voiceRow?.style ?? '0.3')
-    },
+    settings: Object.fromEntries(
+      Object.entries(settings).filter(([, value]) => value !== undefined)
+    ),
     sampleRate: parseInt(voiceRow?.sample_rate || '16000', 10)
   };
 };

@@ -4,12 +4,39 @@ require('dotenv').config();
 
 const DEFAULT_SAMPLE_RATE = 16000;
 const DEFAULT_OUTPUT_FORMAT = process.env.ELEVENLABS_OUTPUT_FORMAT || 'mp3_22050_32';
-const DEFAULT_VOICE_SETTINGS = {
-  stability: 0.5,
-  similarity_boost: 0.75,
-  style: 0.3,
-  use_speaker_boost: true
+const clamp = (value, min, max, fallback) => {
+  const numeric = Number.parseFloat(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, numeric));
 };
+const parseBoolean = (value, fallback) => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].includes(normalized)) {
+      return true;
+    }
+    if (['false', '0', 'no', 'off'].includes(normalized)) {
+      return false;
+    }
+  }
+  return fallback;
+};
+const DEFAULT_VOICE_SETTINGS = {
+  stability: clamp(process.env.ELEVENLABS_DEFAULT_STABILITY || '0.72', 0, 1, 0.72),
+  similarity_boost: clamp(process.env.ELEVENLABS_DEFAULT_SIMILARITY_BOOST || '0.8', 0, 1, 0.8),
+  style: clamp(process.env.ELEVENLABS_DEFAULT_STYLE || '0.08', 0, 1, 0.08),
+  use_speaker_boost: parseBoolean(process.env.ELEVENLABS_DEFAULT_SPEAKER_BOOST, true)
+};
+const DEFAULT_STREAMING_LATENCY = Math.max(
+  0,
+  parseInt(process.env.ELEVENLABS_STREAMING_LATENCY || '0', 10)
+);
+const DEFAULT_TURBO = parseBoolean(process.env.ELEVENLABS_TURBO, false);
 
 const buildHeaders = () => {
   if (!process.env.ELEVENLABS_API_KEY) {
@@ -30,6 +57,21 @@ const BASE_BACKOFF_MS = parseInt(process.env.ELEVENLABS_BACKOFF_MS || '750', 10)
 
 let nextSlot = 0;
 let limiter = Promise.resolve();
+
+const normalizeVoiceSettings = (settings = {}) => ({
+  stability: clamp(settings.stability, 0, 1, DEFAULT_VOICE_SETTINGS.stability),
+  similarity_boost: clamp(
+    settings.similarity_boost,
+    0,
+    1,
+    DEFAULT_VOICE_SETTINGS.similarity_boost
+  ),
+  style: clamp(settings.style, 0, 1, DEFAULT_VOICE_SETTINGS.style),
+  use_speaker_boost: parseBoolean(
+    settings.use_speaker_boost,
+    DEFAULT_VOICE_SETTINGS.use_speaker_boost
+  )
+});
 
 const scheduleRateLimited = (task) => {
   limiter = limiter.then(async () => {
@@ -59,11 +101,11 @@ const synthesizeSentence = async ({
   const payload = {
     text,
     model_id: process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2',
-    voice_settings: { ...DEFAULT_VOICE_SETTINGS, ...settings },
-    optimize_streaming_latency: 2,
+    voice_settings: normalizeVoiceSettings(settings),
+    optimize_streaming_latency: DEFAULT_STREAMING_LATENCY,
     output_format: DEFAULT_OUTPUT_FORMAT,
     language,
-    turbo: process.env.ELEVENLABS_TURBO === 'true'
+    turbo: DEFAULT_TURBO
   };
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;

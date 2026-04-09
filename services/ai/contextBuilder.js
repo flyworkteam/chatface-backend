@@ -62,7 +62,14 @@ const normalizeRole = (role) => {
   return 'user';
 };
 
-const buildContext = async ({ sessionId, personaId, summaries = [], mode = 'chat', conversationLanguage }) => {
+const buildContext = async ({
+  sessionId,
+  personaId,
+  summaries = [],
+  mode = 'chat',
+  conversationLanguage,
+  pendingMessages = []
+}) => {
   const contextLimit = isVoiceMode(mode) ? VOICE_CONTEXT_WINDOW : CHAT_CONTEXT_WINDOW;
 
   const [persona, messages] = await Promise.all([
@@ -78,10 +85,16 @@ const buildContext = async ({ sessionId, personaId, summaries = [], mode = 'chat
     role: normalizeRole(message.role),
     content: toContentItems(message.content)
   }));
+  const inMemoryMessages = Array.isArray(pendingMessages)
+    ? pendingMessages.map((message) => ({
+        role: normalizeRole(message.role),
+        content: toContentItems(message.content)
+      }))
+    : [];
 
   return {
     systemPrompt: buildSystemPrompt(persona, summaries, conversationLanguage),
-    messages: formattedMessages,
+    messages: [...formattedMessages, ...inMemoryMessages],
     persona
   };
 };

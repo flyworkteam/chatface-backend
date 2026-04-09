@@ -1,6 +1,29 @@
 const { pool } = require('../../config/database');
 
 const DEFAULT_CONTEXT_WINDOW = 40;
+const CACHE_TTL_MS = parseInt(process.env.PERSONA_CACHE_TTL_MS || '300000', 10);
+const personaCache = new Map();
+const personaVoiceCache = new Map();
+
+const getCachedValue = (cache, key) => {
+  const cached = cache.get(key);
+  if (!cached) {
+    return null;
+  }
+  if (cached.expiresAt < Date.now()) {
+    cache.delete(key);
+    return null;
+  }
+  return cached.value;
+};
+
+const setCachedValue = (cache, key, value) => {
+  cache.set(key, {
+    value,
+    expiresAt: Date.now() + CACHE_TTL_MS
+  });
+  return value;
+};
 
 const fetchRecentMessages = async (sessionId, limit = DEFAULT_CONTEXT_WINDOW) => {
   const [rows] = await pool.execute(
@@ -41,6 +64,12 @@ const saveMessage = async ({ sessionId, role, content }) => {
 };
 
 const getPersonaById = async (personaId) => {
+  const cacheKey = String(personaId);
+  const cached = getCachedValue(personaCache, cacheKey);
+  if (cached) {
+    return cached;
+  }
+
   const [rows] = await pool.execute(
     `SELECT id, name, description, prompt_template, default_language
      FROM persona_profiles
@@ -48,10 +77,21 @@ const getPersonaById = async (personaId) => {
     [personaId]
   );
 
-  return rows[0] || null;
+  const persona = rows[0] || null;
+  if (!persona) {
+    return null;
+  }
+
+  return setCachedValue(personaCache, cacheKey, persona);
 };
 
 const getPersonaVoice = async (personaId, language) => {
+  const cacheKey = `${personaId}:${language}`;
+  const cached = getCachedValue(personaVoiceCache, cacheKey);
+  if (cached) {
+    return cached;
+  }
+
   const [rows] = await pool.execute(
     `SELECT persona_id, language_code, elevenlabs_voice_id, style, timbre, lip_sync_preset, sample_rate
      FROM persona_voices
@@ -61,7 +101,12 @@ const getPersonaVoice = async (personaId, language) => {
     [personaId, language]
   );
 
-  return rows[0] || null;
+  const voice = rows[0] || null;
+  if (!voice) {
+    return null;
+  }
+
+  return setCachedValue(personaVoiceCache, cacheKey, voice);
 };
 
 const getMessageById = async (messageId) => {
