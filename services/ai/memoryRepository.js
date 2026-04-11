@@ -41,11 +41,11 @@ const fetchRecentMessages = async (sessionId, limit = DEFAULT_CONTEXT_WINDOW) =>
   }));
 };
 
-const saveMessage = async ({ sessionId, role, content }) => {
+const saveMessage = async ({ sessionId, role, content, historyVisible = true }) => {
   const [result] = await pool.execute(
-    `INSERT INTO session_messages (session_id, role, content_json)
-     VALUES (?, ?, ?)`,
-    [sessionId, role, JSON.stringify(content)]
+    `INSERT INTO session_messages (session_id, role, content_json, history_visible)
+     VALUES (?, ?, ?, ?)`,
+    [sessionId, role, JSON.stringify(content), historyVisible ? 1 : 0]
   );
 
   const insertId = result.insertId;

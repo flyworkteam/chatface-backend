@@ -23,16 +23,6 @@ const INLINE_ATTACHMENT_LIMIT = 350 * 1024; // 350KB
 
 const isVoiceMode = (mode) => mode === 'voice_call' || mode === 'video_call';
 
-const getConversationEndText = (conversationType) => {
-  if (conversationType === 'video_call') {
-    return 'Video call ended';
-  }
-  if (conversationType === 'voice_call') {
-    return 'Voice call ended';
-  }
-  return null;
-};
-
 const resolveConversationMetadata = ({ payload, metadata, defaultType = 'chat' }) => {
   const payloadType = payload?.conversationType;
   const metadataType = metadata?.conversationType;
@@ -151,6 +141,7 @@ const handleUserMessage = async (
 
   const isCallConversation = conversationType === 'voice_call' || conversationType === 'video_call';
   const isConversationEndEvent = isCallConversation && conversationStatus === 'ended';
+  const isActiveCallConversation = isCallConversation && conversationStatus === 'active';
 
   const attachments = sanitizeAttachmentsForStorage(payload.attachments);
   const hasContent = Boolean(text) || attachments.length > 0;
@@ -170,24 +161,6 @@ const handleUserMessage = async (
   sendEvent('ack', { messageId: payload.clientMessageId });
 
   if (isConversationEndEvent) {
-    const endText = getConversationEndText(conversationType);
-    const savedMarker = await saveMessage({
-      sessionId: session.id,
-      role: 'system',
-      content: {
-        text: endText,
-        displayText: endText,
-        metadata
-      }
-    });
-
-    sendEvent('conversation_marker', {
-      messageId: savedMarker.id,
-      sessionId: session.id,
-      createdAt: savedMarker.createdAt,
-      text: endText,
-      metadata
-    });
     return;
   }
 
@@ -265,7 +238,8 @@ const handleUserMessage = async (
     await saveMessage({
       sessionId: session.id,
       role: 'user',
-      content: userContent
+      content: userContent,
+      historyVisible: !isActiveCallConversation
     });
   });
 
@@ -355,7 +329,15 @@ const handleUserMessage = async (
         saveMessage({
           sessionId: session.id,
           role: 'assistant',
-          content: { text: llmResult.fullText }
+          content: {
+            text: llmResult.fullText,
+            metadata: {
+              conversationType,
+              conversationStatus,
+              languageCode: activeLanguage
+            }
+          },
+          historyVisible: !isActiveCallConversation
         }),
         recordUsage({
           sessionId: session.id,

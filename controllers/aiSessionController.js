@@ -438,6 +438,7 @@ const getConversationHistory = async (req, res, next) => {
        INNER JOIN (
          SELECT session_id, MAX(id) AS last_message_id
          FROM session_messages
+         WHERE history_visible = 1
          GROUP BY session_id
        ) latest ON latest.session_id = s.id
        LEFT JOIN session_messages sm ON sm.id = latest.last_message_id
@@ -504,7 +505,7 @@ const getConversationMessages = async (req, res, next) => {
       });
     }
 
-    const conditions = ['sm.session_id = ?'];
+    const conditions = ['sm.session_id = ?', 'sm.history_visible = 1'];
     const params = [sessionId];
     if (beforeId) {
       conditions.push('sm.id < ?');
