@@ -110,6 +110,34 @@ const previewText = (text, limit = 120) => {
   return normalized.length > limit ? `${normalized.slice(0, limit)}…` : normalized;
 };
 
+const elapsedSec = (startedAt) =>
+  startedAt ? Number(((Date.now() - startedAt) / 1000).toFixed(3)) : undefined;
+
+const buildModerationLogPayload = ({
+  session,
+  user,
+  sessionMode,
+  text,
+  metadata,
+  moderationResult
+}) => ({
+  sessionId: session.id,
+  userId: user.id,
+  transcriptId: metadata.transcriptId,
+  mode: sessionMode,
+  textPreview: previewText(text),
+  reason: moderationResult.reason,
+  flaggedCategories: moderationResult.flaggedCategories || [],
+  categoryScores: moderationResult.categoryScores || {}
+});
+
+const buildModerationErrorPayload = (moderationResult) => ({
+  type: 'moderation',
+  code: 'moderation',
+  message: 'Message blocked',
+  reason: moderationResult.reason
+});
+
 const queueBackgroundTask = (label, task) => {
   Promise.resolve()
     .then(task)
@@ -122,6 +150,7 @@ const handleUserMessage = async (
   sendEvent,
   options = {}
 ) => {
+  const turnStartedAt = Date.now();
   const text = payload.text?.trim();
 
   const metadata = {
@@ -211,6 +240,7 @@ const handleUserMessage = async (
   const activeLanguage = normalizeLanguageCode(session.language, DEFAULT_LANGUAGE);
   const shouldAutoTts = isVoiceMode(sessionMode);
   const userContent = { text, metadata, attachments };
+  const prepStartedAt = Date.now();
   const moderationPromise = text
     ? reviewText(text)
     : Promise.resolve({ blocked: false });
@@ -229,8 +259,26 @@ const handleUserMessage = async (
       : Promise.resolve(null)
   ]);
 
+  if (shouldAutoTts) {
+    log('Voice turn pre-LLM prep completed', {
+      sessionId: session.id,
+      userId: user.id,
+      stageSec: elapsedSec(prepStartedAt),
+      turnSec: elapsedSec(turnStartedAt),
+      language: activeLanguage
+    });
+  }
+
   if (moderationResult.blocked) {
-    sendEvent('error', { type: 'moderation', message: 'Message blocked' });
+    log('Moderation blocked user message', buildModerationLogPayload({
+      session,
+      user,
+      sessionMode,
+      text,
+      metadata,
+      moderationResult
+    }));
+    sendEvent('error', buildModerationErrorPayload(moderationResult));
     return;
   }
 
@@ -264,10 +312,14 @@ const handleUserMessage = async (
   }
 
   const assembler = shouldAutoTts
-    ? new SentenceAssembler({
+    ? (() => {
+      let previousSpeechText = '';
+      return new SentenceAssembler({
       onSentenceComplete: (sentence) => {
         cancelThinkingVoice(session.id, sendEvent);
         const sequence = `${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const previousText = previousSpeechText;
+        previousSpeechText = `${previousSpeechText} ${sentence}`.replace(/\s+/g, ' ').trim();
         enqueueSentence({
           sessionId: session.id,
           personaId: session.personaId,
@@ -277,16 +329,28 @@ const handleUserMessage = async (
           sendEvent,
           userId: user.id,
           sequence,
-          playbackId: responsePlaybackId
+          playbackId: responsePlaybackId,
+          previousText,
+          mode: sessionMode,
+          liveStream: true,
+          turnStartedAt
         });
       }
-    })
+      });
+    })()
     : null;
 
   const startedAt = Date.now();
   let emittedFirstDelta = false;
 
   try {
+    if (shouldAutoTts) {
+      log('Voice turn LLM request started', {
+        sessionId: session.id,
+        userId: user.id,
+        turnSec: elapsedSec(turnStartedAt)
+      });
+    }
     const llmResult = await streamChatCompletion({
       systemPrompt: context.systemPrompt,
       messages: context.messages,
@@ -299,6 +363,8 @@ const handleUserMessage = async (
             log('First assistant delta emitted', {
               sessionId: session.id,
               userId: user.id,
+              stageSec: elapsedSec(startedAt),
+              turnSec: elapsedSec(turnStartedAt),
               latencyMs: Date.now() - startedAt
             });
           }
@@ -487,7 +553,10 @@ const handleSttTranscript = async ({ session, user }, payload, sendEvent) => {
   log('STT final promoted to user message', {
     sessionId: session.id,
     transcriptId,
-    metadataKeys: Object.keys(payload.metadata || {})
+    metadataKeys: Object.keys(payload.metadata || {}),
+    sttSec: payload.metadata?.latencyMs
+      ? Number((payload.metadata.latencyMs / 1000).toFixed(3))
+      : undefined
   });
 
   const metadata = { ...(payload.metadata || {}) };
@@ -524,6 +593,8 @@ const handleSttTranscript = async ({ session, user }, payload, sendEvent) => {
 };
 
 module.exports = {
+  buildModerationErrorPayload,
+  buildModerationLogPayload,
   handleUserMessage,
   handleSttTranscript
 };

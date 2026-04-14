@@ -53,6 +53,7 @@ const handleTtsRequest = async ({ session, user }, payload, sendEvent) => {
       sendEvent(type, { ...data, messageId, playbackId });
     };
 
+    let previousText = '';
     for (let index = 0; index < sentences.length; index += 1) {
       const sentence = sentences[index];
       const sequence = `${session.id}-${messageId}-${index}`;
@@ -64,8 +65,10 @@ const handleTtsRequest = async ({ session, user }, payload, sendEvent) => {
         voiceConfig,
         sendEvent: emit,
         userId: user.id,
-        sequence
+        sequence,
+        previousText
       });
+      previousText = `${previousText} ${sentence}`.replace(/\s+/g, ' ').trim();
     }
   } catch (error) {
     warn('On-demand TTS failed', error.message);

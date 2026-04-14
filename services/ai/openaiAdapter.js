@@ -1,4 +1,9 @@
-const { getOpenAIClient, getChatModel } = require('./openaiClient');
+const {
+  getOpenAIClient,
+  getChatModel,
+  getVoiceReasoningEffort,
+  getVoiceVerbosity
+} = require('./openaiClient');
 
 const VOICE_GENERATION_CONFIG = {
   temperature: 0.7,
@@ -12,6 +17,7 @@ const CHAT_GENERATION_CONFIG = {
 };
 
 const isVoiceMode = (mode) => mode === 'voice_call' || mode === 'video_call';
+const supportsGpt5Controls = (model = '') => /^gpt-5(?:\.|$|-)/i.test(model);
 
 const toInputContent = (items = [], role = 'user') => {
   const content = [];
@@ -104,21 +110,47 @@ const extractOutputText = (response) => {
     .join('');
 };
 
-const streamChatCompletion = async ({ systemPrompt, messages, onDelta, mode = 'chat' }) => {
-  const client = getOpenAIClient();
-  const generationConfig = isVoiceMode(mode) ? VOICE_GENERATION_CONFIG : CHAT_GENERATION_CONFIG;
-
-  const stream = client.responses.stream({
-    model: getChatModel(mode),
+const buildResponseStreamRequest = ({ systemPrompt, messages, mode = 'chat' }) => {
+  const voiceMode = isVoiceMode(mode);
+  const generationConfig = voiceMode ? VOICE_GENERATION_CONFIG : CHAT_GENERATION_CONFIG;
+  const model = getChatModel(mode);
+  const request = {
+    model,
     instructions: systemPrompt,
     input: messages.map((message) => ({
       role: message.role,
       content: toInputContent(message.content, message.role)
-    })),
-    temperature: generationConfig.temperature,
-    top_p: generationConfig.topP,
-    max_output_tokens: generationConfig.maxOutputTokens
-  });
+    }))
+  };
+
+  if (generationConfig.maxOutputTokens) {
+    request.max_output_tokens = generationConfig.maxOutputTokens;
+  }
+
+  if (!supportsGpt5Controls(model)) {
+    request.temperature = generationConfig.temperature;
+    request.top_p = generationConfig.topP;
+  }
+
+  if (voiceMode && supportsGpt5Controls(model)) {
+    const reasoningEffort = getVoiceReasoningEffort();
+    const verbosity = getVoiceVerbosity();
+    if (reasoningEffort) {
+      request.reasoning = { effort: reasoningEffort };
+    }
+    if (verbosity) {
+      request.text = { verbosity };
+    }
+  }
+
+  return request;
+};
+
+const streamChatCompletion = async ({ systemPrompt, messages, onDelta, mode = 'chat' }) => {
+  const client = getOpenAIClient();
+  const stream = client.responses.stream(
+    buildResponseStreamRequest({ systemPrompt, messages, mode })
+  );
 
   let fullText = '';
 
@@ -148,5 +180,6 @@ const streamChatCompletion = async ({ systemPrompt, messages, onDelta, mode = 'c
 };
 
 module.exports = {
+  buildResponseStreamRequest,
   streamChatCompletion
 };

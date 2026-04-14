@@ -4,12 +4,30 @@ const TRANSIENT_TTL_MS = parseInt(process.env.TTS_TRANSIENT_TTL_MS || '900000', 
 const CACHE_VERSION = process.env.TTS_CACHE_VERSION || '20260408-quality-v1';
 const transientAudio = new Map();
 
-const buildCacheKey = (personaId, language, text, variant) => {
-  return crypto.createHash('sha1').update(`${CACHE_VERSION}:${personaId}:${language}:${variant}:${text}`).digest('hex');
+const normalizeCacheContext = (cacheContext = {}) => {
+  if (!cacheContext || typeof cacheContext !== 'object') {
+    return '';
+  }
+  return JSON.stringify(
+    Object.keys(cacheContext)
+      .sort()
+      .reduce((acc, key) => {
+        acc[key] = cacheContext[key];
+        return acc;
+      }, {})
+  );
 };
 
-const fetchCachedAudio = async ({ personaId, language, text, variant }) => {
-  const key = buildCacheKey(personaId, language, text, variant);
+const buildCacheKey = (personaId, language, text, variant, cacheContext = {}) => {
+  const context = normalizeCacheContext(cacheContext);
+  return crypto
+    .createHash('sha1')
+    .update(`${CACHE_VERSION}:${personaId}:${language}:${variant}:${context}:${text}`)
+    .digest('hex');
+};
+
+const fetchCachedAudio = async ({ personaId, language, text, variant, cacheContext }) => {
+  const key = buildCacheKey(personaId, language, text, variant, cacheContext);
   const [rows] = await pool.execute(
     `SELECT audio_base64, mouth_cues_json, hit_count, cdn_url
      FROM tts_cache
@@ -57,8 +75,17 @@ const fetchCachedAudioByKey = async ({ cacheKey }) => {
   };
 };
 
-const storeCachedAudio = async ({ personaId, language, text, variant, audioBase64, mouthCues, cdnUrl = null }) => {
-  const key = buildCacheKey(personaId, language, text, variant);
+const storeCachedAudio = async ({
+  personaId,
+  language,
+  text,
+  variant,
+  audioBase64,
+  mouthCues,
+  cdnUrl = null,
+  cacheContext
+}) => {
+  const key = buildCacheKey(personaId, language, text, variant, cacheContext);
   await pool.execute(
     `INSERT INTO tts_cache (cache_key, persona_id, language_code, variant, audio_base64, mouth_cues_json, cdn_url, hit_count)
      VALUES (?, ?, ?, ?, ?, ?, ?, 1)

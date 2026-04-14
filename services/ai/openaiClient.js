@@ -1,8 +1,10 @@
 const OpenAI = require('openai');
 
 const DEFAULT_CHAT_MODEL = 'gpt-4o-mini';
-const DEFAULT_VOICE_MODEL = 'gpt-4o-mini';
+const DEFAULT_VOICE_MODEL = 'gpt-5.4-mini';
 const DEFAULT_MODERATION_MODEL = 'omni-moderation-latest';
+const DEFAULT_VOICE_REASONING_EFFORT = 'none';
+const DEFAULT_VOICE_VERBOSITY = 'low';
 
 let client;
 
@@ -25,18 +27,25 @@ const getOpenAIClient = () => {
 const isVoiceMode = (mode) => mode === 'voice_call' || mode === 'video_call';
 
 const getChatModel = (mode = 'chat') =>
-  isVoiceMode(mode)
-    ? process.env.OPENAI_VOICE_MODEL || DEFAULT_VOICE_MODEL
-    : process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL;
+  isVoiceMode(mode) ? DEFAULT_VOICE_MODEL : DEFAULT_CHAT_MODEL;
 
-const getModerationModel = () =>
-  process.env.OPENAI_MODERATION_MODEL || DEFAULT_MODERATION_MODEL;
+const getVoiceReasoningEffort = () =>
+  process.env.OPENAI_VOICE_REASONING_EFFORT || DEFAULT_VOICE_REASONING_EFFORT;
+
+const getVoiceVerbosity = () =>
+  process.env.OPENAI_VOICE_VERBOSITY || DEFAULT_VOICE_VERBOSITY;
+
+const getModerationModel = () => DEFAULT_MODERATION_MODEL;
 
 module.exports = {
   DEFAULT_CHAT_MODEL,
   DEFAULT_VOICE_MODEL,
   DEFAULT_MODERATION_MODEL,
+  DEFAULT_VOICE_REASONING_EFFORT,
+  DEFAULT_VOICE_VERBOSITY,
   getOpenAIClient,
   getChatModel,
+  getVoiceReasoningEffort,
+  getVoiceVerbosity,
   getModerationModel
 };

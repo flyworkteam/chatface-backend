@@ -3,6 +3,7 @@ const { v4: uuidv4 } = require('uuid');
 const sharp = require('sharp');
 const { uploadBuffer } = require('../utils/bunny');
 const { fetchCachedAudioByKey } = require('../services/ai/ttsCacheService');
+const { attachLiveTtsStream } = require('../services/ai/liveTtsStreamService');
 const {
   SUPPORTED_SESSION_LANGUAGES,
   normalizeLanguageCode
@@ -654,6 +655,20 @@ const getTtsCacheAudio = async (req, res, next) => {
   }
 };
 
+const getLiveTtsAudio = (req, res) => {
+  const streamId = req.params.streamId;
+  const token = req.query.token;
+
+  if (!/^[a-f0-9]{36}$/i.test(streamId || '') || typeof token !== 'string') {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid live audio stream'
+    });
+  }
+
+  attachLiveTtsStream({ id: streamId, token, res });
+};
+
 module.exports = {
   createSession,
   listPersonas,
@@ -663,5 +678,6 @@ module.exports = {
   getConversationHistory,
   getConversationMessages,
   uploadImageAttachment,
-  getTtsCacheAudio
+  getTtsCacheAudio,
+  getLiveTtsAudio
 };

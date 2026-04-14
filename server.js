@@ -14,7 +14,10 @@ const languageRoutes = require('./routes/language');
 const notificationRoutes = require('./routes/notification');
 const webhookRoutes = require('./routes/webhook');
 const aiSessionRoutes = require('./routes/aiSession');
-const { getTtsCacheAudio } = require('./controllers/aiSessionController');
+const {
+  getLiveTtsAudio,
+  getTtsCacheAudio
+} = require('./controllers/aiSessionController');
 const { initializeRealtimeGateway } = require('./websocket/realtimeGateway');
 const http = require('http');
 
@@ -75,6 +78,7 @@ app.use('/api/languages', languageRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/webhooks', webhookRoutes);
 app.get('/api/ai/tts/cache/:cacheKey', getTtsCacheAudio);
+app.get('/api/ai/tts/live/:streamId', getLiveTtsAudio);
 app.use('/api/ai', aiSessionRoutes);
 
 

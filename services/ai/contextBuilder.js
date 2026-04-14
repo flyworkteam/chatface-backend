@@ -17,6 +17,10 @@ const buildSystemPrompt = (persona, summaries = [], conversationLanguage) => {
   return `${persona.prompt_template}${ttsSafetyBlock}${languageBlock}\n${summaryBlock}`.trim();
 };
 
+const buildVoicePromptSuffix = () => `\nVoice call pacing:
+- Begin with a brief complete sentence that can be spoken immediately.
+- Continue naturally only when the reply needs more detail.`;
+
 const ATTACHMENT_INLINE_LIMIT = 350 * 1024; // 350KB safeguard
 
 const toContentItems = (content = {}) => {
@@ -93,7 +97,7 @@ const buildContext = async ({
     : [];
 
   return {
-    systemPrompt: buildSystemPrompt(persona, summaries, conversationLanguage),
+    systemPrompt: `${buildSystemPrompt(persona, summaries, conversationLanguage)}${isVoiceMode(mode) ? buildVoicePromptSuffix() : ''}`.trim(),
     messages: [...formattedMessages, ...inMemoryMessages],
     persona
   };

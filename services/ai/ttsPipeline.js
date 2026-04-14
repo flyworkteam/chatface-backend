@@ -1,4 +1,7 @@
-const { synthesizeSentence } = require('../../config/elevenlabs');
+const {
+  getTtsCacheContext,
+  synthesizeSentence
+} = require('../../config/elevenlabs');
 const {
   buildCacheKey,
   fetchCachedAudio,
@@ -11,8 +14,17 @@ const { log, warn } = require('./logger');
 const { rememberAssistantSpeech } = require('./echoGuard');
 const { uploadBuffer } = require('../../utils/bunny');
 const { fetchMouthCues } = require('./mouthCueService');
+const {
+  appendLiveTtsStream,
+  createLiveTtsStream,
+  failLiveTtsStream,
+  finishLiveTtsStream
+} = require('./liveTtsStreamService');
 
 const buildAudioUrl = (cacheKey) => `/api/ai/tts/cache/${cacheKey}`;
+const LIVE_STREAM_ENABLED = process.env.TTS_LIVE_STREAM_ENABLED !== 'false';
+const elapsedSec = (startedAt) =>
+  startedAt ? Number(((Date.now() - startedAt) / 1000).toFixed(3)) : undefined;
 const sanitizePathSegment = (value, fallback = 'default') => {
   const normalized = String(value || fallback)
     .trim()
@@ -92,6 +104,7 @@ const streamCachedPayload = async ({
   playbackId,
   personaId,
   language,
+  turnStartedAt,
   shouldAbort
 }) => {
   if (isAborted(shouldAbort)) {
@@ -101,6 +114,12 @@ const streamCachedPayload = async ({
   const audioUrl = cachePayload.cdnUrl || buildAudioUrl(cachePayload.cacheKey);
 
   sendEvent('tts_started', { sequence, playbackId });
+  log('Voice turn cached TTS chunk ready', {
+    playbackId,
+    sequence,
+    turnSec: elapsedSec(turnStartedAt),
+    cacheKey: cachePayload.cacheKey
+  });
   if (isAborted(shouldAbort)) {
     sendEvent('tts_suppressed', { reason: 'cancelled', sequence, playbackId });
     return;
@@ -135,6 +154,7 @@ const streamCachedPayload = async ({
 };
 
 const streamLivePayload = async ({
+  sessionId,
   personaId,
   language,
   text,
@@ -144,6 +164,10 @@ const streamLivePayload = async ({
   userId,
   sequence,
   playbackId,
+  previousText,
+  mode = 'chat',
+  liveStream = false,
+  turnStartedAt,
   shouldAbort
 }) => {
   if (!canUseTTS(userId)) {
@@ -153,14 +177,76 @@ const streamLivePayload = async ({
   }
 
   sendEvent('tts_started', { sequence, playbackId, voice: voiceConfig });
+  const ttsStartedAt = Date.now();
+  let liveStreamRef = null;
+  if (liveStream && LIVE_STREAM_ENABLED) {
+    liveStreamRef = createLiveTtsStream({
+      sessionId,
+      userId,
+      sequence,
+      playbackId
+    });
+    log('Voice turn first TTS stream URL emitted', {
+      playbackId,
+      sequence,
+      stageSec: 0,
+      turnSec: elapsedSec(turnStartedAt),
+      audioUrl: liveStreamRef.url
+    });
+    emitTtsChunk({
+      sendEvent,
+      sequence,
+      playbackId,
+      chunkId: `${sequence}-live`,
+      audioUrl: liveStreamRef.url,
+      audioBase64: null,
+      mouthCues: []
+    });
+  }
 
-  const response = await synthesizeSentence({
-    voiceId: voiceConfig.voiceId,
-    text,
-    language,
-    settings: voiceConfig.settings,
-    sampleRate: voiceConfig.sampleRate
-  });
+  let response;
+  try {
+    response = await synthesizeSentence({
+      voiceId: voiceConfig.voiceId,
+      text,
+      language,
+      settings: voiceConfig.settings,
+      sampleRate: voiceConfig.sampleRate,
+      previousText,
+      mode,
+      onTiming: (event, data) => {
+        log(event, {
+          playbackId,
+          sequence,
+          turnSec: elapsedSec(turnStartedAt),
+          ...data
+        });
+      },
+      onAudioChunk: liveStreamRef
+        ? (chunk) => {
+            if (!liveStreamRef.firstProviderChunkLogged) {
+              liveStreamRef.firstProviderChunkLogged = true;
+              log('Voice turn first ElevenLabs audio bytes received', {
+                playbackId,
+                sequence,
+                stageSec: elapsedSec(ttsStartedAt),
+                turnSec: elapsedSec(turnStartedAt),
+                byteLength: chunk.length
+              });
+            }
+            appendLiveTtsStream(liveStreamRef.id, chunk);
+          }
+        : undefined
+    });
+    if (liveStreamRef) {
+      finishLiveTtsStream(liveStreamRef.id);
+    }
+  } catch (error) {
+    if (liveStreamRef) {
+      failLiveTtsStream(liveStreamRef.id, error);
+    }
+    throw error;
+  }
   if (isAborted(shouldAbort)) {
     sendEvent('tts_suppressed', { reason: 'cancelled', sequence, playbackId });
     return;
@@ -168,7 +254,12 @@ const streamLivePayload = async ({
 
   const audioBase64 = response.audioBuffer.toString('base64');
   const mouthCues = response.mouthCues || [];
-  const cacheKey = buildCacheKey(personaId, language, text, variant);
+  const cacheContext = getTtsCacheContext({
+    voiceId: voiceConfig.voiceId,
+    language,
+    mode
+  });
+  const cacheKey = buildCacheKey(personaId, language, text, variant, cacheContext);
   const audioUrl = buildAudioUrl(cacheKey);
 
   incrementQuota(userId, text.length);
@@ -179,16 +270,26 @@ const streamLivePayload = async ({
     cdnUrl: null
   });
 
-  emitTtsChunk({
-    sendEvent,
-    sequence,
-    playbackId,
-    chunkId: `${sequence}-0`,
-    audioUrl,
-    audioBase64,
-    mouthCues
-  });
+  if (!liveStreamRef) {
+    emitTtsChunk({
+      sendEvent,
+      sequence,
+      playbackId,
+      chunkId: `${sequence}-0`,
+      audioUrl,
+      audioBase64,
+      mouthCues
+    });
+  }
   sendEvent('tts_done', { sequence, playbackId });
+  log('Voice turn TTS provider completed', {
+    playbackId,
+    sequence,
+    stageSec: elapsedSec(ttsStartedAt),
+    turnSec: elapsedSec(turnStartedAt),
+    liveStream: Boolean(liveStreamRef),
+    byteLength: response.audioBuffer.length
+  });
 
   queueBackgroundTask('Failed to persist live TTS audio', async () => {
     await storeCachedAudio({
@@ -197,7 +298,8 @@ const streamLivePayload = async ({
       text,
       variant,
       audioBase64,
-      mouthCues
+      mouthCues,
+      cacheContext
     });
   });
 
@@ -232,6 +334,10 @@ const enqueueSentence = async ({
   userId,
   sequence,
   playbackId,
+  previousText,
+  mode = 'chat',
+  liveStream,
+  turnStartedAt,
   shouldAbort
 }) => {
   try {
@@ -241,7 +347,18 @@ const enqueueSentence = async ({
       return;
     }
 
-    const cached = await fetchCachedAudio({ personaId, language, text, variant });
+    const cacheContext = getTtsCacheContext({
+      voiceId: voiceConfig.voiceId,
+      language,
+      mode
+    });
+    const cached = await fetchCachedAudio({
+      personaId,
+      language,
+      text,
+      variant,
+      cacheContext
+    });
     if (cached) {
       await streamCachedPayload({
         cachePayload: cached,
@@ -250,12 +367,14 @@ const enqueueSentence = async ({
         playbackId,
         personaId,
         language,
+        turnStartedAt,
         shouldAbort
       });
       return;
     }
 
     await streamLivePayload({
+      sessionId,
       personaId,
       language,
       text,
@@ -265,9 +384,16 @@ const enqueueSentence = async ({
       userId,
       sequence,
       playbackId,
+      previousText,
+      mode,
+      liveStream,
+      turnStartedAt,
       shouldAbort
     });
   } catch (error) {
+    if (error.liveStreamId) {
+      failLiveTtsStream(error.liveStreamId, error);
+    }
     if (error.code === 'ELEVENLABS_RATE_LIMIT' || error.isRateLimit) {
       warn('TTS pipeline suppressed due to provider rate limit');
       sendEvent('tts_suppressed', { reason: 'provider_rate_limited', sequence, playbackId });
