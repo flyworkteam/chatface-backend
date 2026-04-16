@@ -1,25 +1,50 @@
 const { fetchRecentMessages, getPersonaById } = require('./memoryRepository');
 const { getLanguageName } = require('./languageSupport');
+const { debug, warn } = require('./logger');
+const { getWebhookUrl, isN8nConfigured } = require('../../config/n8n');
 
 const CHAT_CONTEXT_WINDOW = 40;
 const VOICE_CONTEXT_WINDOW = 12;
+const USE_N8N_PERSONA_CONFIG = process.env.USE_N8N_PERSONA_CONFIG === 'true';
+const PERSONA_PROMPT_CACHE_MS = parseInt(process.env.PERSONA_PROMPT_CACHE_MS || '300000', 10);
+const personaPromptCache = new Map();
 
 const isVoiceMode = (mode) => mode === 'voice_call' || mode === 'video_call';
 
-const buildSystemPrompt = (persona, summaries = [], conversationLanguage) => {
+const buildSystemPrompt = (persona, summaries = [], conversationLanguage, mode = 'chat') => {
   const summaryBlock = summaries.length
-    ? `\nConversation summaries:\n${summaries.map((s) => `- ${s.summary}`).join('\n')}`
+    ? `\nConversation context (from earlier in this session):\n${summaries.map((s) => `- ${s.summary}`).join('\n')}`
     : '';
 
-  const ttsSafetyBlock = `\nOutput rules for speech synthesis:\n- Do not use emojis, emoticons, or decorative symbols.\n- Use plain readable text with standard punctuation.\n- Avoid markdown formatting, lists with special bullets, and unusual characters.\n- Keep responses natural and easy to read out loud.`;
-  const languageBlock = `\nLanguage rules:\n- Reply in ${getLanguageName(conversationLanguage)}.\n- Match the user's latest accepted language for this session.\n- If the user input is ambiguous, stay in the current conversation language.`;
+  // TTS safety: LLM must never produce symbols that break speech synthesis
+  const ttsSafetyBlock = `\nSpeech output rules (critical — your reply will be spoken aloud):
+- Write in plain, natural spoken sentences. No emojis, emoticons, or decorative symbols.
+- No markdown: no asterisks, no bullet points, no headers, no code blocks.
+- Spell out abbreviations the first time (e.g. "by the way" not "btw").
+- Use commas and natural pauses instead of dashes or parentheses.
+- Numbers: say "twenty five" not "25" when it reads more naturally aloud.`;
+
+  // Sesli/görüntülü aramada dil kilitlenir (STT doğrulama zaten mecbur tutuyor).
+  // Yazılı chat'te ise kullanıcı hangi dilde yazarsa o dilde cevap ver;
+  // bu sayede önceki konuşmadan bağımsız olarak dil değişebilir.
+  const languageBlock = isVoiceMode(mode)
+    ? `\nLanguage rules:
+- Always reply in ${getLanguageName(conversationLanguage)}.
+- Stay strictly in ${getLanguageName(conversationLanguage)} for the entire conversation; do not switch languages even if the user tries.`
+    : `\nLanguage rules:
+- Detect the language the user is writing in and reply in that same language.
+- If the user writes in Turkish, respond entirely in Turkish. If they write in English, respond in English. Follow whatever language they use in each message.
+- Do not default to a fixed language; always mirror the user's current language.`;
 
   return `${persona.prompt_template}${ttsSafetyBlock}${languageBlock}\n${summaryBlock}`.trim();
 };
 
-const buildVoicePromptSuffix = () => `\nVoice call pacing:
-- Begin with a brief complete sentence that can be spoken immediately.
-- Continue naturally only when the reply needs more detail.`;
+const buildVoicePromptSuffix = () => `\nVoice call behavior:
+- Keep each reply short and conversational — typically one to three sentences.
+- Lead with your most important thought in the very first sentence so it can be spoken immediately.
+- Avoid listing things; weave information naturally into speech.
+- Match the user's energy and pace: if they're brief, be brief; if they elaborate, you can too.
+- Never start with filler phrases like "Certainly!" or "Of course!" — just respond naturally.`;
 
 const ATTACHMENT_INLINE_LIMIT = 350 * 1024; // 350KB safeguard
 
@@ -66,6 +91,103 @@ const normalizeRole = (role) => {
   return 'user';
 };
 
+const buildPersonaPromptCacheKey = (personaId) => String(personaId || '');
+
+const getCachedPersonaPrompt = (personaId) => {
+  const key = buildPersonaPromptCacheKey(personaId);
+  const cached = personaPromptCache.get(key);
+  if (!cached) {
+    return null;
+  }
+  if (cached.expiresAt > Date.now()) {
+    return cached.prompt;
+  }
+  return null;
+};
+
+const setCachedPersonaPrompt = (personaId, prompt, ttlMs = PERSONA_PROMPT_CACHE_MS) => {
+  const key = buildPersonaPromptCacheKey(personaId);
+  personaPromptCache.set(key, {
+    prompt,
+    expiresAt: Date.now() + Math.max(1000, ttlMs)
+  });
+};
+
+const getAnyCachedPersonaPrompt = (personaId) => {
+  const key = buildPersonaPromptCacheKey(personaId);
+  return personaPromptCache.get(key)?.prompt || null;
+};
+
+const resolvePromptFromPayload = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  const candidates = [
+    payload.systemPrompt,
+    payload.promptTemplate,
+    payload.prompt,
+    payload?.data?.systemPrompt,
+    payload?.data?.promptTemplate,
+    payload?.data?.prompt
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
+};
+
+const fetchPersonaPromptTemplateViaN8n = async (personaId, fallbackPromptTemplate) => {
+  if (!USE_N8N_PERSONA_CONFIG || !isN8nConfigured()) {
+    return fallbackPromptTemplate;
+  }
+
+  const hotCache = getCachedPersonaPrompt(personaId);
+  if (hotCache) {
+    return hotCache;
+  }
+
+  const baseWebhookUrl = getWebhookUrl('personaConfig');
+  if (!baseWebhookUrl) {
+    return fallbackPromptTemplate;
+  }
+
+  const webhookUrl = `${baseWebhookUrl}/${encodeURIComponent(String(personaId))}`;
+
+  try {
+    const response = await fetch(webhookUrl, {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-n8n-secret': process.env.N8N_WEBHOOK_SECRET || ''
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`status ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const promptTemplate = resolvePromptFromPayload(payload);
+    if (!promptTemplate) {
+      throw new Error('Missing systemPrompt/promptTemplate in persona-config response');
+    }
+
+    setCachedPersonaPrompt(personaId, promptTemplate);
+    return promptTemplate;
+  } catch (error) {
+    const stalePrompt = getAnyCachedPersonaPrompt(personaId);
+    if (stalePrompt) {
+      warn('Persona prompt fetch failed; using stale cached prompt', error.message);
+      return stalePrompt;
+    }
+    debug('Persona prompt fetch failed; using DB prompt template', error.message);
+    return fallbackPromptTemplate;
+  }
+};
+
 const buildContext = async ({
   sessionId,
   personaId,
@@ -85,6 +207,11 @@ const buildContext = async ({
     throw new Error('Persona not found or inactive');
   }
 
+  const promptTemplate = await fetchPersonaPromptTemplateViaN8n(
+    persona.id,
+    persona.prompt_template
+  );
+
   const formattedMessages = messages.map((message) => ({
     role: normalizeRole(message.role),
     content: toContentItems(message.content)
@@ -97,7 +224,7 @@ const buildContext = async ({
     : [];
 
   return {
-    systemPrompt: `${buildSystemPrompt(persona, summaries, conversationLanguage)}${isVoiceMode(mode) ? buildVoicePromptSuffix() : ''}`.trim(),
+    systemPrompt: `${buildSystemPrompt({ ...persona, prompt_template: promptTemplate }, summaries, conversationLanguage, mode)}${isVoiceMode(mode) ? buildVoicePromptSuffix() : ''}`.trim(),
     messages: [...formattedMessages, ...inMemoryMessages],
     persona
   };

@@ -361,10 +361,10 @@ const appendChunk = (controller, payload) => {
     return false;
   }
   const durationMs = estimateDurationMs(normalized.byteLength, controller.sampleRate, controller.encoding);
-  if (!hasSessionSttBudget(controller.sessionId, durationMs)) {
-    sendSttError(controller, 'Streaming STT quota exceeded for this session.', summarizeQuota(controller.sessionId));
-    return false;
-  }
+  // if (!hasSessionSttBudget(controller.sessionId, durationMs)) {
+  //   sendSttError(controller, 'Streaming STT quota exceeded for this session.', summarizeQuota(controller.sessionId));
+  //   return false;
+  // }
 
   const now = Date.now();
   const wallClockElapsed = now - controller.startedAt;
@@ -398,11 +398,23 @@ const commitBuffer = (controller) => {
   if (!controller.socket || controller.socket.readyState !== WebSocket.OPEN) {
     return;
   }
+  // Guard: OpenAI requires at least MIN_COMMIT_AUDIO_MS (100 ms) of buffered audio
+  // before accepting a commit.  Sending a commit with an empty or nearly-empty
+  // buffer produces the "buffer too small" error seen in the Flutter logs when
+  // STT is stopped multiple times in rapid succession (e.g. on TTS playback start).
   if (controller.pendingCommitMs < MIN_COMMIT_AUDIO_MS) {
     return;
   }
-  controller.socket.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+  // Atomically reset BEFORE the async send so that concurrent stopStream calls
+  // triggered by the Flutter client cannot race through the check above and send
+  // a second commit after the buffer is already drained.
+  const msToCommit = controller.pendingCommitMs;
   controller.pendingCommitMs = 0;
+  controller.socket.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+  log('STT buffer committed', {
+    sessionId: controller.sessionId,
+    committedMs: msToCommit
+  });
 };
 
 const startStream = async ({ session, user, sendEvent, onTranscript }, options = {}) => {

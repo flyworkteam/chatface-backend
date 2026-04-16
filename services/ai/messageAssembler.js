@@ -1,7 +1,12 @@
 const SENTENCE_BOUNDARY_REGEX = /(?<=[\.\!\?])/;
-const MIN_SPEECH_CHUNK_CHARS = parseInt(process.env.TTS_MIN_CHUNK_CHARS || '48', 10);
-const MIN_SPEECH_CHUNK_WORDS = parseInt(process.env.TTS_MIN_CHUNK_WORDS || '6', 10);
-const MAX_SPEECH_CHUNK_CHARS = parseInt(process.env.TTS_MAX_CHUNK_CHARS || '180', 10);
+// Increased from 48→70 chars and 6→9 words to merge short sentences more aggressively.
+// This reduces chunk count for long responses (e.g. 355-word story: 14 chunks → ~7-8),
+// cutting Flutter TTS queue wait times from 20+ s to under 10 s.
+const MIN_SPEECH_CHUNK_CHARS = parseInt(process.env.TTS_MIN_CHUNK_CHARS || '70', 10);
+const MIN_SPEECH_CHUNK_WORDS = parseInt(process.env.TTS_MIN_CHUNK_WORDS || '9', 10);
+// Increased from 180→300 chars: larger chunks mean fewer ElevenLabs calls and
+// fewer AVPlayer items, reducing exposure to the iOS continuation-leak bug.
+const MAX_SPEECH_CHUNK_CHARS = parseInt(process.env.TTS_MAX_CHUNK_CHARS || '300', 10);
 const FIRST_CHUNK_MIN_CHARS = parseInt(process.env.TTS_FIRST_CHUNK_MIN_CHARS || '28', 10);
 const FIRST_CHUNK_MIN_WORDS = parseInt(process.env.TTS_FIRST_CHUNK_MIN_WORDS || '4', 10);
 const FIRST_CLAUSE_BOUNDARY_REGEX = /[,;:]\s+/g;

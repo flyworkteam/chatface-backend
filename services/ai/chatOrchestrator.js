@@ -7,19 +7,31 @@ const {
 } = require('./memoryRepository');
 const { reviewText } = require('./moderationService');
 const { enqueueSentence } = require('./ttsPipeline');
-const { streamChatCompletion } = require('./openaiAdapter');
 const { warn, log, debug } = require('./logger');
 const { buildVoiceConfig, DEFAULT_LANGUAGE } = require('./voice');
-const { scheduleThinkingVoice, cancelThinkingVoice } = require('./thinkingVoices');
+const { scheduleThinkingVoice, cancelThinkingVoice, playRejectionVoice } = require('./thinkingVoices');
 const { findEchoMatch, isAssistantSpeechActive } = require('./echoGuard');
 const { updateSessionLanguage } = require('./sessionService');
 const { resolveUserLanguage, validateTranscript } = require('./languageResolution');
 const { normalizeLanguageCode } = require('./languageSupport');
 
+// Phase 2: n8n LLM adapter (used when USE_N8N_LLM=true)
+const USE_N8N_LLM = process.env.USE_N8N_LLM === 'true';
+const { streamChatCompletion: streamChatCompletionDirect } = require('./openaiAdapter');
+const { streamChatCompletionViaN8n } = require('./n8nLlmAdapter');
+const streamChatCompletion = USE_N8N_LLM ? streamChatCompletionViaN8n : streamChatCompletionDirect;
+
+// Phase 4: async n8n analytics fire
+const {
+  fireWebhook,
+  validateNodeInternalBaseUrl
+} = require('../../config/n8n');
+
 const VALID_CONVERSATION_TYPES = new Set(['chat', 'voice_call', 'video_call']);
 const VALID_CONVERSATION_STATUSES = new Set(['active', 'ended']);
 const MAX_ATTACHMENTS = 5;
 const INLINE_ATTACHMENT_LIMIT = 350 * 1024; // 350KB
+const USE_N8N_MODERATION_ASYNC = process.env.USE_N8N_MODERATION_ASYNC === 'true';
 
 const isVoiceMode = (mode) => mode === 'voice_call' || mode === 'video_call';
 
@@ -153,6 +165,10 @@ const handleUserMessage = async (
   const turnStartedAt = Date.now();
   const text = payload.text?.trim();
 
+  // ── Phase 0: Per-turn timing instrumentation ────────────────────────────
+  // Populated throughout the turn; included in assistant_done for observability.
+  const turnTimings = { turnStartMs: 0 };
+
   const metadata = {
     ...options.metadata
   };
@@ -240,13 +256,57 @@ const handleUserMessage = async (
   const activeLanguage = normalizeLanguageCode(session.language, DEFAULT_LANGUAGE);
   const shouldAutoTts = isVoiceMode(sessionMode);
   const userContent = { text, metadata, attachments };
-  const prepStartedAt = Date.now();
-  const moderationPromise = text
-    ? reviewText(text)
-    : Promise.resolve({ blocked: false });
 
-  const [moderationResult, context, personaVoice] = await Promise.all([
-    moderationPromise,
+  // ── Moderation policy handling ────────────────────────────────────────────
+  // Default mode keeps local moderation for policy gating while avoiding
+  // first-token blocking. Optional async n8n mode skips local blocking.
+  let moderationResult = { blocked: false };
+  let moderationBlocked = false;
+
+  const moderationPromise = text && !USE_N8N_MODERATION_ASYNC
+    ? reviewText(text)
+        .then((result) => {
+          turnTimings.moderationDoneMs = Date.now() - turnStartedAt;
+          moderationResult = result;
+          if (result.blocked) {
+            moderationBlocked = true;
+            cancelThinkingVoice(session.id, sendEvent);
+            log('Moderation flagged message (async)', {
+              sessionId: session.id,
+              userId: user.id,
+              turnSec: elapsedSec(turnStartedAt),
+              reason: result.reason
+            });
+          }
+          return result;
+        })
+        .catch((err) => {
+          warn('Moderation check failed, allowing request', err.message);
+          return { blocked: false, degraded: true };
+        })
+    : Promise.resolve({ blocked: false, via: USE_N8N_MODERATION_ASYNC ? 'n8n_async' : 'disabled' });
+
+  if (text && USE_N8N_MODERATION_ASYNC) {
+    const callbackBase = validateNodeInternalBaseUrl().normalized;
+    fireWebhook('moderationCheck', {
+      turnId: payload.clientMessageId || metadata.transcriptId || null,
+      sessionId: session.id,
+      userId: user.id,
+      mode: sessionMode,
+      language: activeLanguage,
+      text,
+      openAiKey: process.env.OPENAI_API_KEY || '',
+      callbackUrl: callbackBase
+        ? `${callbackBase}/api/ai/internal/moderation-result`
+        : null,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  // ── Fetch context + voice config (fast DB calls) ──────────────────────────
+  const prepStartedAt = Date.now();
+
+  const [context, personaVoice] = await Promise.all([
     buildContext({
       sessionId: session.id,
       personaId: session.personaId,
@@ -259,6 +319,8 @@ const handleUserMessage = async (
       : Promise.resolve(null)
   ]);
 
+  turnTimings.prepDoneMs = Date.now() - turnStartedAt;
+
   if (shouldAutoTts) {
     log('Voice turn pre-LLM prep completed', {
       sessionId: session.id,
@@ -269,19 +331,7 @@ const handleUserMessage = async (
     });
   }
 
-  if (moderationResult.blocked) {
-    log('Moderation blocked user message', buildModerationLogPayload({
-      session,
-      user,
-      sessionMode,
-      text,
-      metadata,
-      moderationResult
-    }));
-    sendEvent('error', buildModerationErrorPayload(moderationResult));
-    return;
-  }
-
+  // Persist user message in background — no need to wait
   queueBackgroundTask('Failed to persist user message', async () => {
     await saveMessage({
       sessionId: session.id,
@@ -301,46 +351,57 @@ const handleUserMessage = async (
   if (shouldAutoTts) {
     queueBackgroundTask('Thinking voice failed', async () => {
       scheduleThinkingVoice({
-      session,
-      personaId: session.personaId,
-      language: activeLanguage,
-      voiceConfig: voiceConfig,
-      sendEvent,
-      userId: user.id
+        session,
+        personaId: session.personaId,
+        language: activeLanguage,
+        voiceConfig: voiceConfig,
+        sendEvent,
+        userId: user.id
       });
     });
   }
 
   const assembler = shouldAutoTts
     ? (() => {
-      let previousSpeechText = '';
-      return new SentenceAssembler({
-      onSentenceComplete: (sentence) => {
-        cancelThinkingVoice(session.id, sendEvent);
-        const sequence = `${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        const previousText = previousSpeechText;
-        previousSpeechText = `${previousSpeechText} ${sentence}`.replace(/\s+/g, ' ').trim();
-        enqueueSentence({
-          sessionId: session.id,
-          personaId: session.personaId,
-          language: activeLanguage,
-          text: sentence,
-          voiceConfig: voiceConfig,
-          sendEvent,
-          userId: user.id,
-          sequence,
-          playbackId: responsePlaybackId,
-          previousText,
-          mode: sessionMode,
-          liveStream: true,
-          turnStartedAt
+        let previousSpeechText = '';
+        return new SentenceAssembler({
+          onSentenceComplete: (sentence) => {
+            // Gate TTS enqueue on moderation — if blocked mid-stream, suppress audio
+            if (moderationBlocked) return;
+            cancelThinkingVoice(session.id, sendEvent);
+            const sequence = `${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+            const previousText = previousSpeechText;
+            previousSpeechText = `${previousSpeechText} ${sentence}`.replace(/\s+/g, ' ').trim();
+            if (!turnTimings.firstSentenceEmittedMs) {
+              turnTimings.firstSentenceEmittedMs = Date.now() - turnStartedAt;
+            }
+            enqueueSentence({
+              sessionId: session.id,
+              personaId: session.personaId,
+              language: activeLanguage,
+              text: sentence,
+              voiceConfig: voiceConfig,
+              sendEvent: (type, data = {}) => {
+                if (!turnTimings.firstAudioMs && type === 'tts_chunk' && (data.audioUrl || data.audio)) {
+                  turnTimings.firstAudioMs = Date.now() - turnStartedAt;
+                }
+                sendEvent(type, data);
+              },
+              userId: user.id,
+              sequence,
+              playbackId: responsePlaybackId,
+              previousText,
+              mode: sessionMode,
+              liveStream: true,
+              turnStartedAt
+            });
+          }
         });
-      }
-      });
-    })()
+      })()
     : null;
 
-  const startedAt = Date.now();
+  const llmStartedAt = Date.now();
+  turnTimings.llmStartMs = llmStartedAt - turnStartedAt;
   let emittedFirstDelta = false;
 
   try {
@@ -348,30 +409,39 @@ const handleUserMessage = async (
       log('Voice turn LLM request started', {
         sessionId: session.id,
         userId: user.id,
-        turnSec: elapsedSec(turnStartedAt)
+        turnSec: elapsedSec(turnStartedAt),
+        via: USE_N8N_LLM ? 'n8n' : 'direct'
       });
     }
+
     const llmResult = await streamChatCompletion({
       systemPrompt: context.systemPrompt,
       messages: context.messages,
       mode: sessionMode,
+      analyticsContext: {
+        sessionId: session.id,
+        userId: user.id,
+        personaId: session.personaId,
+        language: activeLanguage
+      },
       onDelta: (delta) => {
-        if (delta) {
-          if (!emittedFirstDelta) {
-            emittedFirstDelta = true;
-            cancelThinkingVoice(session.id, sendEvent);
-            log('First assistant delta emitted', {
-              sessionId: session.id,
-              userId: user.id,
-              stageSec: elapsedSec(startedAt),
-              turnSec: elapsedSec(turnStartedAt),
-              latencyMs: Date.now() - startedAt
-            });
-          }
-          sendEvent('assistant_delta', { delta });
-          if (assembler) {
-            assembler.append(delta);
-          }
+        // Gate on both moderation and content presence
+        if (!delta || moderationBlocked) return;
+        if (!emittedFirstDelta) {
+          emittedFirstDelta = true;
+          turnTimings.llmFirstTokenMs = Date.now() - turnStartedAt;
+          cancelThinkingVoice(session.id, sendEvent);
+          log('First assistant delta emitted', {
+            sessionId: session.id,
+            userId: user.id,
+            stageSec: elapsedSec(llmStartedAt),
+            turnSec: elapsedSec(turnStartedAt),
+            latencyMs: Date.now() - llmStartedAt
+          });
+        }
+        sendEvent('assistant_delta', { delta });
+        if (assembler) {
+          assembler.append(delta);
         }
       }
     });
@@ -381,12 +451,40 @@ const handleUserMessage = async (
     }
     cancelThinkingVoice(session.id, sendEvent);
 
-    const latencyMs = Date.now() - startedAt;
+    // Await moderation before committing the turn result.
+    // In the common case this is already resolved (fast moderation).
+    // In the rare case LLM finished before moderation, we wait here.
+    await moderationPromise;
 
-    // Send assistant_done immediately — don't wait for DB writes
+    if (moderationBlocked) {
+      log('Moderation blocked user message', buildModerationLogPayload({
+        session,
+        user,
+        sessionMode,
+        text,
+        metadata,
+        moderationResult
+      }));
+      sendEvent('error', buildModerationErrorPayload(moderationResult));
+      return;
+    }
+
+    const latencyMs = Date.now() - llmStartedAt;
+    turnTimings.turnEndMs = Date.now() - turnStartedAt;
+
+    // Send assistant_done immediately with full timing breakdown for observability
     sendEvent('assistant_done', {
       latencyMs,
-      messageId: null // will be resolved after save
+      messageId: null, // will be resolved after save
+      timings: {
+        prepMs: turnTimings.prepDoneMs ?? null,
+        llmStartMs: turnTimings.llmStartMs ?? null,
+        llmFirstTokenMs: turnTimings.llmFirstTokenMs ?? null,
+        firstSentenceMs: turnTimings.firstSentenceEmittedMs ?? null,
+        firstAudioMs: turnTimings.firstAudioMs ?? null,
+        moderationMs: turnTimings.moderationDoneMs ?? null,
+        totalMs: turnTimings.turnEndMs ?? null
+      }
     });
 
     // Fire-and-forget: save message + record usage in background
@@ -414,6 +512,30 @@ const handleUserMessage = async (
           latencyMs
         })
       ]);
+    });
+
+    // Phase 4: fire analytics to n8n (true fire-and-forget, never blocks)
+    fireWebhook('aiTurnAnalytics', {
+      sessionId: session.id,
+      userId: user.id,
+      personaId: session.personaId,
+      mode: sessionMode,
+      language: activeLanguage,
+      llmIn: Math.round(llmResult.tokensIn),
+      llmOut: Math.round(llmResult.tokensOut),
+      ttsChars: llmResult.fullText.length,
+      latencyMs,
+      timings: {
+        prepMs: turnTimings.prepDoneMs ?? null,
+        llmFirstTokenMs: turnTimings.llmFirstTokenMs ?? null,
+        firstSentenceMs: turnTimings.firstSentenceEmittedMs ?? null,
+        firstAudioMs: turnTimings.firstAudioMs ?? null,
+        moderationMs: turnTimings.moderationDoneMs ?? null,
+        totalMs: turnTimings.turnEndMs ?? null
+      },
+      viaN8nLlm: USE_N8N_LLM,
+      viaN8nModerationAsync: USE_N8N_MODERATION_ASYNC,
+      timestamp: new Date().toISOString()
     });
   } catch (error) {
     cancelThinkingVoice(session.id, sendEvent);
@@ -547,6 +669,28 @@ const handleSttTranscript = async ({ session, user }, payload, sendEvent) => {
         reason: validation.reason
       }
     });
+
+    // Sessiz kalmak yerine sesli geri bildirim ver:
+    // - 'locked_language_mismatch': yanlış dilde konuşuldu → "Bu dilde konuşamıyorum..."
+    // - diğer sebepler (düşük güven, çok kısa, gürültü): "Anlayamadım, tekrar söyler misin?"
+    // Kullanıcının 2-3 kez tekrar etmek zorunda kalmasını engellemek için hemen çal.
+    queueBackgroundTask('STT rejection voice failed', async () => {
+      const activeLanguage = normalizeLanguageCode(session.language, DEFAULT_LANGUAGE);
+      // getPersonaVoice(personaId, language) — her iki parametre de zorunlu
+      const personaVoice = await getPersonaVoice(session.personaId, activeLanguage);
+      if (!personaVoice) return;
+      const voiceCfg = buildVoiceConfig(personaVoice, activeLanguage);
+      playRejectionVoice({
+        session,
+        personaId: session.personaId,
+        language: activeLanguage,
+        voiceConfig: voiceCfg,
+        sendEvent,
+        userId: user.id,
+        reason: validation.reason
+      });
+    });
+
     return;
   }
 

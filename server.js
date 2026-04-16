@@ -5,6 +5,10 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const { testConnection } = require('./config/database');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
+const {
+  assertRuntimeN8nConfig,
+  runN8nStartupSmokeChecks
+} = require('./config/n8n');
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -14,6 +18,7 @@ const languageRoutes = require('./routes/language');
 const notificationRoutes = require('./routes/notification');
 const webhookRoutes = require('./routes/webhook');
 const aiSessionRoutes = require('./routes/aiSession');
+const internalRoutes = require('./routes/internal');
 const {
   getLiveTtsAudio,
   getTtsCacheAudio
@@ -79,6 +84,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/webhooks', webhookRoutes);
 app.get('/api/ai/tts/cache/:cacheKey', getTtsCacheAudio);
 app.get('/api/ai/tts/live/:streamId', getLiveTtsAudio);
+app.use('/api/ai/internal', internalRoutes); // n8n callback routes (no JWT)
 app.use('/api/ai', aiSessionRoutes);
 
 
@@ -98,6 +104,8 @@ app.use(errorHandler);
 
 const startServer = async () => {
   try {
+    assertRuntimeN8nConfig();
+
     // Test database connection
     const dbConnected = await testConnection();
 
@@ -140,6 +148,24 @@ const startServer = async () => {
       console.log('  POST /api/notifications/interval - Update reminder interval');
       console.log('========================================');
       console.log('');
+
+      if (process.env.N8N_STARTUP_SMOKE_TEST === 'true') {
+        runN8nStartupSmokeChecks()
+          .then((results) => {
+            results.forEach((result) => {
+              if (result.ok) {
+                console.log(`✅ n8n smoke check passed: ${result.key} (${result.status})`);
+              } else {
+                console.warn(
+                  `⚠️  n8n smoke check failed: ${result.key} (${result.status || 'ERR'})${result.error ? ` - ${result.error}` : ''}`
+                );
+              }
+            });
+          })
+          .catch((error) => {
+            console.warn('⚠️  n8n startup smoke checks failed:', error.message);
+          });
+      }
     });
 
   } catch (error) {

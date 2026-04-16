@@ -1,7 +1,12 @@
 const {
   getTtsCacheContext,
-  synthesizeSentence
+  synthesizeSentence: synthesizeSentenceDirect,
+  synthesizeSentenceViaN8n
 } = require('../../config/elevenlabs');
+
+// Phase 3: route TTS through n8n when USE_N8N_TTS=true
+const USE_N8N_TTS = process.env.USE_N8N_TTS === 'true';
+const synthesizeSentence = USE_N8N_TTS ? synthesizeSentenceViaN8n : synthesizeSentenceDirect;
 const {
   buildCacheKey,
   fetchCachedAudio,
@@ -10,6 +15,7 @@ const {
   primeTransientAudio
 } = require('./ttsCacheService');
 const { canUseTTS, incrementQuota } = require('./quotaService');
+const { recordTtsCacheMiss } = require('./ttsWarmQueue');
 const { log, warn } = require('./logger');
 const { rememberAssistantSpeech } = require('./echoGuard');
 const { uploadBuffer } = require('../../utils/bunny');
@@ -25,6 +31,8 @@ const buildAudioUrl = (cacheKey) => `/api/ai/tts/cache/${cacheKey}`;
 const LIVE_STREAM_ENABLED = process.env.TTS_LIVE_STREAM_ENABLED !== 'false';
 const elapsedSec = (startedAt) =>
   startedAt ? Number(((Date.now() - startedAt) / 1000).toFixed(3)) : undefined;
+const normalizeTtsText = (value = '') => String(value || '').replace(/\s+/g, ' ').trim();
+const hasSpeakableChars = (value = '') => /[\p{L}\p{N}]/u.test(value);
 const sanitizePathSegment = (value, fallback = 'default') => {
   const normalized = String(value || fallback)
     .trim()
@@ -52,6 +60,12 @@ const queueBackgroundTask = (label, task) => {
 };
 
 const isAborted = (shouldAbort) => typeof shouldAbort === 'function' && shouldAbort() === true;
+const isInvalidTtsText = (text = '') => {
+  const normalized = normalizeTtsText(text);
+  if (!normalized) return true;
+  if (normalized.length < 2) return true;
+  return !hasSpeakableChars(normalized);
+};
 
 const emitTtsChunk = ({
   sendEvent,
@@ -281,7 +295,11 @@ const streamLivePayload = async ({
       mouthCues
     });
   }
-  sendEvent('tts_done', { sequence, playbackId });
+  // For live-stream chunks we already emitted the stream URL with mouthCues:[].
+  // Now that synthesis is complete we have the real mouthCues from ElevenLabs;
+  // include them in tts_done so the Flutter client can apply lip-sync without
+  // waiting for the slow background CDN viseme-enrichment pass.
+  sendEvent('tts_done', { sequence, playbackId, mouthCues: liveStreamRef ? mouthCues : [] });
   log('Voice turn TTS provider completed', {
     playbackId,
     sequence,
@@ -341,7 +359,22 @@ const enqueueSentence = async ({
   shouldAbort
 }) => {
   try {
-    rememberAssistantSpeech({ sessionId, text, playbackId });
+    const normalizedText = normalizeTtsText(text);
+
+    if (isInvalidTtsText(normalizedText)) {
+      warn('TTS pipeline suppressed due to invalid sentence text', {
+        sessionId,
+        personaId,
+        language,
+        sequence,
+        playbackId,
+        textPreview: normalizedText.slice(0, 80)
+      });
+      sendEvent('tts_suppressed', { reason: 'invalid_text', sequence, playbackId });
+      return;
+    }
+
+    rememberAssistantSpeech({ sessionId, text: normalizedText, playbackId });
 
     if (isAborted(shouldAbort)) {
       return;
@@ -355,7 +388,7 @@ const enqueueSentence = async ({
     const cached = await fetchCachedAudio({
       personaId,
       language,
-      text,
+      text: normalizedText,
       variant,
       cacheContext
     });
@@ -373,11 +406,18 @@ const enqueueSentence = async ({
       return;
     }
 
+    recordTtsCacheMiss({
+      personaId,
+      language,
+      variant,
+      text: normalizedText
+    });
+
     await streamLivePayload({
       sessionId,
       personaId,
       language,
-      text,
+      text: normalizedText,
       variant,
       voiceConfig,
       sendEvent,

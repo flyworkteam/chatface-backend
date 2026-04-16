@@ -39,7 +39,7 @@ const DEFAULT_STREAMING_LATENCY = Math.max(
   parseInt(process.env.ELEVENLABS_STREAMING_LATENCY || '0', 10)
 );
 const DEFAULT_TURBO = parseBoolean(process.env.ELEVENLABS_TURBO, false);
-const TTS_MODEL = 'eleven_multilingual_v2';
+const TTS_MODEL = 'eleven_flash_v2_5';
 const CALL_TTS_MODEL = 'eleven_flash_v2_5';
 
 const buildHeaders = () => {
@@ -388,11 +388,134 @@ const synthesizeSentence = async ({
   throw lastError;
 };
 
+// ── Phase 3: n8n TTS adapter ──────────────────────────────────────────────
+//
+// Routes ElevenLabs synthesis through n8n (USE_N8N_TTS=true).
+// n8n calls ElevenLabs internally and returns the audio buffer.
+// Overhead vs. direct call: ~40ms (same-datacenter Hostinger VPS hop).
+//
+// n8n workflow "tts-synthesize" must accept the same payload as buildTtsPayload()
+// and respond with the raw audio binary (Content-Type: audio/mpeg).
+
+const { getWebhookUrl, isN8nConfigured } = require('./n8n');
+
+const synthesizeSentenceViaN8n = async ({
+  voiceId,
+  text,
+  language,
+  settings = {},
+  sampleRate = DEFAULT_SAMPLE_RATE,
+  previousText,
+  nextText,
+  mode = 'chat',
+  onTiming,
+  onAudioChunk
+}) => {
+  if (!voiceId) {
+    throw new Error('voiceId is required for TTS');
+  }
+  if (!isN8nConfigured()) {
+    throw new Error('n8n TTS: n8n is not configured (N8N_WEBHOOK_BASE_URL / N8N_WEBHOOK_SECRET missing)');
+  }
+
+  const payload = buildTtsPayload({ voiceId, text, language, settings, previousText, nextText, mode });
+  const modelId = payload.model_id;
+  const optimizeStreamingLatency = payload.optimize_streaming_latency;
+
+  onTiming?.('tts_provider_request_started', {
+    modelId,
+    optimizeStreamingLatency,
+    outputFormat: DEFAULT_OUTPUT_FORMAT,
+    textLength: text.length,
+    voiceId,
+    language,
+    via: 'n8n'
+  });
+
+  const requestStartedAt = Date.now();
+  const webhookUrl = getWebhookUrl('ttsSynthesize');
+
+  const response = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-n8n-secret': process.env.N8N_WEBHOOK_SECRET || ''
+    },
+    body: JSON.stringify({
+      // n8n tts workflow builds the ElevenLabs endpoint from voice id.
+      // Keep both snake_case and camelCase for backward compatibility.
+      voice_id: voiceId,
+      voiceId,
+      ...payload,
+      elevenLabsKey: process.env.ELEVENLABS_API_KEY || ''
+    })
+  });
+
+  const responseHeadersSec = Number(((Date.now() - requestStartedAt) / 1000).toFixed(3));
+  onTiming?.('tts_provider_response_headers', {
+    modelId,
+    optimizeStreamingLatency,
+    outputFormat: DEFAULT_OUTPUT_FORMAT,
+    textLength: text.length,
+    voiceId,
+    language,
+    responseHeadersSec,
+    via: 'n8n'
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`n8n TTS workflow returned ${response.status}: ${errText}`);
+  }
+
+  // Contract: n8n tts-synthesize returns { audio: "<base64>" } JSON.
+  // Transitional fallback keeps compatibility with older exports using base64Audio.
+  const json = await response.json();
+  const base64Audio = json.audio || json.base64Audio;
+  if (!base64Audio) {
+    throw new Error('n8n TTS workflow response missing audio field');
+  }
+  const audioBuffer = Buffer.from(base64Audio, 'base64');
+
+  onTiming?.('tts_provider_first_byte', {
+    modelId,
+    optimizeStreamingLatency,
+    textLength: text.length,
+    voiceId,
+    language,
+    firstByteSec: Number(((Date.now() - requestStartedAt) / 1000).toFixed(3)),
+    byteLength: audioBuffer.length,
+    via: 'n8n'
+  });
+
+  if (onAudioChunk) {
+    onAudioChunk(audioBuffer);
+  }
+
+  onTiming?.('tts_provider_complete', {
+    modelId,
+    optimizeStreamingLatency,
+    textLength: text.length,
+    voiceId,
+    language,
+    completeSec: Number(((Date.now() - requestStartedAt) / 1000).toFixed(3)),
+    via: 'n8n'
+  });
+
+  return {
+    audioBuffer,
+    mimeType: 'audio/mpeg',
+    alignmentKey: null,
+    mouthCues: []
+  };
+};
+
 module.exports = {
   buildTtsPayload,
   getTtsCacheContext,
   resolveModelId,
   resolveStreamingLatency,
   resolvePronunciationDictionaryLocators,
-  synthesizeSentence
+  synthesizeSentence,
+  synthesizeSentenceViaN8n
 };
