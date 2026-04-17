@@ -7,6 +7,13 @@ const { pool } = require('../config/database');
  */
 const authenticateToken = async (req, res, next) => {
   try {
+    // n8n/internal callbacks must not require user JWT.
+    // Keep this guard so callbacks work even if route mount order changes.
+    const requestPath = (req.originalUrl || req.url || '').split('?')[0];
+    if (requestPath === '/api/ai/internal' || requestPath.startsWith('/api/ai/internal/')) {
+      return next();
+    }
+
     // Get token from Authorization header
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN

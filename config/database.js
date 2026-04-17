@@ -1,8 +1,8 @@
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 
-// MySQL connection pool configuration
 const pool = mysql.createPool({
+  timezone: 'Z',
   host: process.env.DB_HOST,
   port: process.env.DB_PORT || 3306,
   user: process.env.DB_USER,
