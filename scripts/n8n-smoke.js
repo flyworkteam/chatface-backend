@@ -9,6 +9,8 @@ const {
 } = require('../config/n8n');
 
 const TIMEOUT_MS = parseInt(process.env.N8N_SMOKE_TIMEOUT_MS || '8000', 10);
+const CALLBACK_PATH_PREFIX =
+  (process.env.N8N_INTERNAL_CALLBACK_PATH || '/api/n8n').replace(/\/+$/, '');
 
 const requestJson = async ({ url, method = 'GET', headers = {}, body = null }) => {
   const controller = new AbortController();
@@ -67,8 +69,7 @@ const main = async () => {
   }
 
   const headers = {
-    'Content-Type': 'application/json',
-    'x-n8n-secret': process.env.N8N_WEBHOOK_SECRET || ''
+    'Content-Type': 'application/json'
   };
 
   const checks = [];
@@ -77,7 +78,7 @@ const main = async () => {
     checks.push({
       name: 'node-internal-status',
       task: requestJson({
-        url: `${nodeBase.normalized}/api/ai/internal/status`
+        url: `${nodeBase.normalized}${CALLBACK_PATH_PREFIX}/status`
       })
     });
   }
@@ -95,9 +96,9 @@ const main = async () => {
         messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
         mode: 'chat',
         openAiKey: 'smoke-key',
-        sentenceCallbackUrl: `${nodeBase.normalized || 'https://example.com'}/api/ai/internal/llm-sentence`,
-        doneCallbackUrl: `${nodeBase.normalized || 'https://example.com'}/api/ai/internal/llm-done`,
-        errorCallbackUrl: `${nodeBase.normalized || 'https://example.com'}/api/ai/internal/llm-error`
+        sentenceCallbackUrl: `${nodeBase.normalized || 'https://example.com'}${CALLBACK_PATH_PREFIX}/llm-sentence`,
+        doneCallbackUrl: `${nodeBase.normalized || 'https://example.com'}${CALLBACK_PATH_PREFIX}/llm-done`,
+        errorCallbackUrl: `${nodeBase.normalized || 'https://example.com'}${CALLBACK_PATH_PREFIX}/llm-error`
       }
     })
   });

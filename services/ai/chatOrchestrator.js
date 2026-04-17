@@ -297,7 +297,7 @@ const handleUserMessage = async (
       text,
       openAiKey: process.env.OPENAI_API_KEY || '',
       callbackUrl: callbackBase
-        ? `${callbackBase}/api/ai/internal/moderation-result`
+        ? `${callbackBase}/api/n8n/moderation-result`
         : null,
       timestamp: new Date().toISOString()
     });
@@ -472,6 +472,10 @@ const handleUserMessage = async (
     const latencyMs = Date.now() - llmStartedAt;
     turnTimings.turnEndMs = Date.now() - turnStartedAt;
 
+    const moderationTimingMs = Number.isFinite(turnTimings.moderationDoneMs)
+      ? turnTimings.moderationDoneMs
+      : 0;
+
     // Send assistant_done immediately with full timing breakdown for observability
     sendEvent('assistant_done', {
       latencyMs,
@@ -482,7 +486,7 @@ const handleUserMessage = async (
         llmFirstTokenMs: turnTimings.llmFirstTokenMs ?? null,
         firstSentenceMs: turnTimings.firstSentenceEmittedMs ?? null,
         firstAudioMs: turnTimings.firstAudioMs ?? null,
-        moderationMs: turnTimings.moderationDoneMs ?? null,
+        moderationMs: moderationTimingMs,
         totalMs: turnTimings.turnEndMs ?? null
       }
     });
@@ -530,7 +534,7 @@ const handleUserMessage = async (
         llmFirstTokenMs: turnTimings.llmFirstTokenMs ?? null,
         firstSentenceMs: turnTimings.firstSentenceEmittedMs ?? null,
         firstAudioMs: turnTimings.firstAudioMs ?? null,
-        moderationMs: turnTimings.moderationDoneMs ?? null,
+        moderationMs: moderationTimingMs,
         totalMs: turnTimings.turnEndMs ?? null
       },
       viaN8nLlm: USE_N8N_LLM,

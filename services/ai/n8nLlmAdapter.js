@@ -6,8 +6,8 @@
  * Architecture:
  *   Node → POST n8n /webhook/ai-chat (with prompt + callbackUrl)
  *   n8n  → OpenAI streaming internally
- *   n8n  → POST Node /api/ai/internal/llm-sentence  (per sentence)
- *   n8n  → POST Node /api/ai/internal/llm-done      (when complete)
+ *   n8n  → POST Node /api/n8n/llm-sentence  (per sentence)
+ *   n8n  → POST Node /api/n8n/llm-done      (when complete)
  *
  * Each in-flight LLM turn is tracked in `pendingTurns` by a unique turnId.
  * The sentence callback feeds individual characters into onDelta to maintain
@@ -24,6 +24,8 @@ const {
 const { warn, log } = require('./logger');
 
 const LLM_TURN_TIMEOUT_MS = parseInt(process.env.N8N_LLM_TIMEOUT_MS || '30000', 10);
+const INTERNAL_CALLBACK_PATH_PREFIX =
+  (process.env.N8N_INTERNAL_CALLBACK_PATH || '/api/n8n').replace(/\/+$/, '');
 
 // Map of turnId → { onSentence, resolve, reject, timeoutHandle }
 const pendingTurns = new Map();
@@ -164,7 +166,7 @@ const streamChatCompletionViaN8n = ({
   return new Promise((resolve, reject) => {
     if (!isN8nConfigured()) {
       warn('n8n LLM adapter: n8n is not configured, falling back to error');
-      return reject(new Error('n8n is not configured (N8N_WEBHOOK_BASE_URL / N8N_WEBHOOK_SECRET missing)'));
+      return reject(new Error('n8n is not configured (N8N_WEBHOOK_BASE_URL missing)'));
     }
 
     const nodeBaseValidation = validateNodeInternalBaseUrl();
@@ -212,8 +214,7 @@ const streamChatCompletionViaN8n = ({
     fetch(webhookUrl, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'x-n8n-secret': process.env.N8N_WEBHOOK_SECRET || ''
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         turnId,
@@ -222,9 +223,9 @@ const streamChatCompletionViaN8n = ({
         mode,
         openAiKey: process.env.OPENAI_API_KEY || '',
         openAiModel: process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini',
-        sentenceCallbackUrl: `${callbackBase}/api/ai/internal/llm-sentence`,
-        doneCallbackUrl: `${callbackBase}/api/ai/internal/llm-done`,
-        errorCallbackUrl: `${callbackBase}/api/ai/internal/llm-error`
+        sentenceCallbackUrl: `${callbackBase}${INTERNAL_CALLBACK_PATH_PREFIX}/llm-sentence`,
+        doneCallbackUrl: `${callbackBase}${INTERNAL_CALLBACK_PATH_PREFIX}/llm-done`,
+        errorCallbackUrl: `${callbackBase}${INTERNAL_CALLBACK_PATH_PREFIX}/llm-error`
       })
     })
       .then(async (response) => {

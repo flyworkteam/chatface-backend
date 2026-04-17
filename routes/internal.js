@@ -2,7 +2,7 @@
  * routes/internal.js
  *
  * Internal callback routes called by n8n workflows.
- * Mounted at /api/ai/internal — no auth for now (both VPS on same Hostinger datacenter).
+ * Mounted at /api/n8n — no auth for now (both VPS on same Hostinger datacenter).
  *
  * Phase 2 routes: LLM sentence/done/error callbacks from n8n ai-chat workflow
  * Phase 3 routes: TTS prime-cache callback from n8n tts-cache-warmer workflow
@@ -19,6 +19,50 @@ const {
 const { primeTransientAudio } = require('../services/ai/ttsCacheService');
 const { getTopTtsCacheMisses } = require('../services/ai/ttsWarmQueue');
 const { warn, log } = require('../services/ai/logger');
+const {
+  runN8nStartupSmokeChecks,
+  validateNodeInternalBaseUrl
+} = require('../config/n8n');
+
+const SMOKE_TIMEOUT_MS = parseInt(process.env.N8N_SMOKE_TIMEOUT_MS || '6000', 10);
+const CALLBACK_PATH_PREFIX =
+  (process.env.N8N_INTERNAL_CALLBACK_PATH || '/api/n8n').replace(/\/+$/, '');
+
+const requestJson = async ({ url, method = 'GET', body = null }) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SMOKE_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal
+    });
+
+    let text = '';
+    try {
+      text = await response.text();
+    } catch (_err) {
+      text = '';
+    }
+
+    return {
+      ok: response.ok,
+      status: response.status,
+      body: text.slice(0, 280)
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: error.message
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+};
 
 // ── Phase 2: LLM callbacks ────────────────────────────────────────────────
 
@@ -129,6 +173,42 @@ router.get('/cache-miss-report', (req, res) => {
 router.get('/status', (req, res) => {
   res.json({
     pendingLlmTurns: getPendingTurnCount(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ── On-demand smoke checks (curl-friendly) ────────────────────────────────
+
+router.get('/smoke', async (_req, res) => {
+  const nodeBase = validateNodeInternalBaseUrl();
+  const webhookChecks = await runN8nStartupSmokeChecks();
+
+  let nodeStatusProbe = null;
+  let llmDoneProbe = null;
+
+  if (nodeBase.normalized) {
+    nodeStatusProbe = await requestJson({
+      url: `${nodeBase.normalized}${CALLBACK_PATH_PREFIX}/status`
+    });
+
+    llmDoneProbe = await requestJson({
+      url: `${nodeBase.normalized}${CALLBACK_PATH_PREFIX}/llm-done`,
+      method: 'POST',
+      body: { turnId: `smoke-${Date.now()}` }
+    });
+  }
+
+  const webhookOk = webhookChecks.every((check) => check.ok);
+  const nodeProbeOk = (!nodeStatusProbe || nodeStatusProbe.ok) && (!llmDoneProbe || llmDoneProbe.ok);
+
+  res.json({
+    ok: webhookOk && nodeProbeOk,
+    nodeInternalBase: nodeBase,
+    checks: {
+      nodeInternalStatus: nodeStatusProbe,
+      nodeInternalLlmDone: llmDoneProbe,
+      webhooks: webhookChecks
+    },
     timestamp: new Date().toISOString()
   });
 });

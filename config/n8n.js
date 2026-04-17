@@ -2,7 +2,6 @@ require('dotenv').config();
 
 const n8nConfig = {
   baseUrl: process.env.N8N_WEBHOOK_BASE_URL || '',
-  webhookSecret: process.env.N8N_WEBHOOK_SECRET || '',
 
   webhooks: {
     // Legacy lifecycle hooks
@@ -25,10 +24,11 @@ const n8nConfig = {
 };
 
 /**
- * Returns true when both base URL and secret are configured.
+ * Returns true when n8n base URL is configured.
+ * Webhook secret is optional (depends on n8n webhook auth mode).
  */
 const isN8nConfigured = () =>
-  !!(n8nConfig.baseUrl && n8nConfig.webhookSecret);
+  !!n8nConfig.baseUrl;
 
 const normalizeBaseUrl = (value = '') => String(value || '').replace(/\/+$/, '');
 const normalizeWebhookPath = (value = '') => {
@@ -137,7 +137,7 @@ const assertRuntimeN8nConfig = () => {
  */
 const getWebhookUrl = (webhookPathOrKey) => {
   if (!isN8nConfigured()) {
-    console.warn('⚠️  n8n is not configured (N8N_WEBHOOK_BASE_URL / N8N_WEBHOOK_SECRET missing)');
+    console.warn('⚠️  n8n is not configured (N8N_WEBHOOK_BASE_URL missing)');
     return null;
   }
   const path = normalizeWebhookPath(n8nConfig.webhooks[webhookPathOrKey] ?? webhookPathOrKey);
@@ -158,8 +158,7 @@ const fireWebhook = (webhookPathOrKey, body = {}) => {
   fetch(url, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
-      'x-n8n-secret': n8nConfig.webhookSecret
+      'Content-Type': 'application/json'
     },
     body: JSON.stringify(body)
   }).catch((err) => {
@@ -189,8 +188,7 @@ const runN8nStartupSmokeChecks = async () => {
       const response = await fetch(url, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          'x-n8n-secret': n8nConfig.webhookSecret
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify(check.body),
         signal: controller.signal

@@ -10,7 +10,6 @@ const freshN8nLlmAdapter = () => {
 test('n8n LLM adapter fails fast when webhook returns non-2xx', async () => {
   const oldEnv = {
     N8N_WEBHOOK_BASE_URL: process.env.N8N_WEBHOOK_BASE_URL,
-    N8N_WEBHOOK_SECRET: process.env.N8N_WEBHOOK_SECRET,
     NODE_INTERNAL_BASE_URL: process.env.NODE_INTERNAL_BASE_URL,
     USE_N8N_LLM: process.env.USE_N8N_LLM,
     OPENAI_API_KEY: process.env.OPENAI_API_KEY,
@@ -19,7 +18,6 @@ test('n8n LLM adapter fails fast when webhook returns non-2xx', async () => {
   const oldFetch = global.fetch;
 
   process.env.N8N_WEBHOOK_BASE_URL = 'https://n8n.example.com/webhook';
-  process.env.N8N_WEBHOOK_SECRET = 'secret';
   process.env.NODE_INTERNAL_BASE_URL = 'https://api.example.com';
   process.env.USE_N8N_LLM = 'true';
   process.env.OPENAI_API_KEY = 'key';

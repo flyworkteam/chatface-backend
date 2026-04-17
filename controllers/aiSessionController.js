@@ -13,6 +13,24 @@ const MAX_ATTACHMENT_UPLOAD_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION = 1536;
 const THUMBNAIL_DIMENSION = 512;
 const SUPPORTED_PERSONA_GENDERS = new Set(['male', 'female']);
+
+const pad2 = (value) => String(value).padStart(2, '0');
+const toLocalDateTimeString = (value) => {
+  if (!value) return null;
+
+  if (value instanceof Date) {
+    return `${value.getFullYear()}-${pad2(value.getMonth() + 1)}-${pad2(value.getDate())}T${pad2(value.getHours())}:${pad2(value.getMinutes())}:${pad2(value.getSeconds())}`;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().replace(' ', 'T');
+    if (!normalized) return null;
+    // Remove timezone suffix if present; frontend should treat as local wall-clock time.
+    return normalized.replace(/([zZ]|[+-]\d{2}:?\d{2})$/, '');
+  }
+
+  return null;
+};
 const stripInlineFromAttachments = (attachments = []) => {
   if (!Array.isArray(attachments)) {
     return [];
@@ -434,7 +452,8 @@ const getConversationHistory = async (req, res, next) => {
               p.default_language AS persona_default_language,
               latest.last_message_id,
               sm.content_json,
-              sm.created_at
+              sm.created_at,
+              DATE_FORMAT(sm.created_at, '%Y-%m-%d %H:%i:%s') AS created_at_local
        FROM ai_sessions s
        INNER JOIN (
          SELECT session_id, MAX(id) AS last_message_id
@@ -461,7 +480,7 @@ const getConversationHistory = async (req, res, next) => {
           previewText: preview.previewText,
           previewType: preview.previewType,
           lastConversationType: preview.lastConversationType || row.mode,
-          updatedAt: row.created_at,
+          updatedAt: toLocalDateTimeString(row.created_at_local || row.created_at),
           persona: row.persona_id
             ? {
               id: row.persona_id,
@@ -515,7 +534,11 @@ const getConversationMessages = async (req, res, next) => {
     params.push(limit);
 
     const [rows] = await pool.execute(
-      `SELECT sm.id, sm.role, sm.content_json, sm.created_at
+      `SELECT sm.id,
+              sm.role,
+              sm.content_json,
+              sm.created_at,
+              DATE_FORMAT(sm.created_at, '%Y-%m-%d %H:%i:%s') AS created_at_local
        FROM session_messages sm
        WHERE ${conditions.join(' AND ')}
        ORDER BY sm.id DESC
@@ -531,7 +554,7 @@ const getConversationMessages = async (req, res, next) => {
         text: parsed.text || '',
         metadata: parsed.metadata || {},
         attachments: Array.isArray(parsed.attachments) ? parsed.attachments : [],
-        createdAt: row.created_at
+        createdAt: toLocalDateTimeString(row.created_at_local || row.created_at)
       };
     });
 

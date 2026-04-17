@@ -160,8 +160,7 @@ const fetchPersonaPromptTemplateViaN8n = async (personaId, fallbackPromptTemplat
   try {
     const response = await fetch(webhookUrl, {
       headers: {
-        'Content-Type': 'application/json',
-        'x-n8n-secret': process.env.N8N_WEBHOOK_SECRET || ''
+        'Content-Type': 'application/json'
       }
     });
 

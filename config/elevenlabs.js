@@ -415,7 +415,7 @@ const synthesizeSentenceViaN8n = async ({
     throw new Error('voiceId is required for TTS');
   }
   if (!isN8nConfigured()) {
-    throw new Error('n8n TTS: n8n is not configured (N8N_WEBHOOK_BASE_URL / N8N_WEBHOOK_SECRET missing)');
+    throw new Error('n8n TTS: n8n is not configured (N8N_WEBHOOK_BASE_URL missing)');
   }
 
   const payload = buildTtsPayload({ voiceId, text, language, settings, previousText, nextText, mode });
@@ -438,8 +438,7 @@ const synthesizeSentenceViaN8n = async ({
   const response = await fetch(webhookUrl, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
-      'x-n8n-secret': process.env.N8N_WEBHOOK_SECRET || ''
+      'Content-Type': 'application/json'
     },
     body: JSON.stringify({
       // n8n tts workflow builds the ElevenLabs endpoint from voice id.

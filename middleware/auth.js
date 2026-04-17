@@ -7,10 +7,9 @@ const { pool } = require('../config/database');
  */
 const authenticateToken = async (req, res, next) => {
   try {
-    // n8n/internal callbacks must not require user JWT.
-    // Keep this guard so callbacks work even if route mount order changes.
+    // n8n callback endpoints must not require user JWT.
     const requestPath = (req.originalUrl || req.url || '').split('?')[0];
-    if (requestPath === '/api/ai/internal' || requestPath.startsWith('/api/ai/internal/')) {
+    if (requestPath === '/api/n8n' || requestPath.startsWith('/api/n8n/')) {
       return next();
     }
 

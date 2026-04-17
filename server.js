@@ -80,7 +80,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/onboarding', onboardingRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/languages', languageRoutes);
-app.use('/api/ai/internal', internalRoutes); // n8n callback routes (no JWT)
+app.use('/api/n8n', internalRoutes); // n8n callback routes (no JWT)
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/webhooks', webhookRoutes);
 app.get('/api/ai/tts/cache/:cacheKey', getTtsCacheAudio);
