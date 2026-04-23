@@ -8,6 +8,14 @@ const {
   SUPPORTED_SESSION_LANGUAGES,
   normalizeLanguageCode
 } = require('../services/ai/languageSupport');
+const {
+  beginCall: beginCallOnSession,
+  endCall: endCallOnSession,
+  getCallState,
+  reconcileStaleCall
+} = require('../services/ai/sessionService');
+const { clearSessionSpeech } = require('../services/ai/echoGuard');
+const { clearRecentVariants, getFillerManifestForPersona } = require('../services/ai/fillerAudioService');
 
 const MAX_ATTACHMENT_UPLOAD_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION = 1536;
@@ -188,7 +196,7 @@ const createSession = async (req, res, next) => {
     }
 
     const [existingRows] = await pool.execute(
-      `SELECT id
+      `SELECT id, language_code, preferred_mode, active_mode, call_locked_language
        FROM ai_sessions
        WHERE user_id = ? AND persona_id = ?
        ORDER BY created_at DESC
@@ -197,13 +205,38 @@ const createSession = async (req, res, next) => {
     );
 
     if (existingRows.length) {
-      const existingSessionId = existingRows[0].id;
+      const existing = existingRows[0];
+      const existingSessionId = existing.id;
+
+      // IMPORTANT (rewrite v2 §4): session reuse must NOT overwrite the
+      // live call state. We only update `preferred_mode` (UX hint) and
+      // let `active_mode` + `call_locked_language` be driven by
+      // /call/start + /call/end. We also leave `language_code` alone if
+      // the user is mid-call — the orchestrator authoritatively reads
+      // `call_locked_language` for that case.
+      //
+      // If the existing call is stale (disconnected > 90s), reconcile
+      // first so the returned session isn't stuck in a ghost call.
+      await reconcileStaleCall(existingSessionId);
+
       await pool.execute(
         `UPDATE ai_sessions
-         SET language_code = ?, mode = ?, last_seen_at = NOW()
-         WHERE id = ?`,
-        [languageCode, sessionMode, existingSessionId]
+            SET preferred_mode = ?,
+                last_seen_at = NOW()
+          WHERE id = ?`,
+        [sessionMode, existingSessionId]
       );
+
+      // If no call is active, it's safe to let chat mode honor the newly
+      // requested language too.
+      if (!existing.call_locked_language && languageCode) {
+        await pool.execute(
+          `UPDATE ai_sessions
+              SET language_code = ?
+            WHERE id = ?`,
+          [languageCode, existingSessionId]
+        );
+      }
 
       return res.json({
         success: true,
@@ -217,8 +250,9 @@ const createSession = async (req, res, next) => {
     const sessionId = uuidv4();
 
     await pool.execute(
-      `INSERT INTO ai_sessions (id, user_id, persona_id, language_code, mode, last_seen_at)
-       VALUES (?, ?, ?, ?, ?, NOW())`,
+      `INSERT INTO ai_sessions
+         (id, user_id, persona_id, language_code, preferred_mode, active_mode, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, 'chat', NOW())`,
       [sessionId, userId, personaId, languageCode, sessionMode]
     );
 
@@ -354,10 +388,15 @@ const updateSessionLanguagePreference = async (req, res, next) => {
       });
     }
 
+    // Do not overwrite language_code while a call language lock is held —
+    // the orchestrator reads call_locked_language authoritatively during
+    // calls, and flipping language_code out from under chat turns
+    // misleads chat-mode auto-detect.
     await pool.execute(
       `UPDATE ai_sessions
-       SET language_code = ?, last_seen_at = NOW()
-       WHERE id = ?`,
+          SET language_code = ?, last_seen_at = NOW()
+        WHERE id = ?
+          AND call_locked_language IS NULL`,
       [languageCode, sessionId]
     );
 
@@ -446,7 +485,9 @@ const getConversationHistory = async (req, res, next) => {
       `SELECT s.id AS session_id,
               s.persona_id,
               s.language_code,
-              s.mode,
+              s.preferred_mode,
+              s.active_mode,
+              s.call_locked_language,
               p.name AS persona_name,
               p.description AS persona_description,
               p.default_language AS persona_default_language,
@@ -479,7 +520,8 @@ const getConversationHistory = async (req, res, next) => {
           lastMessageId: row.last_message_id,
           previewText: preview.previewText,
           previewType: preview.previewType,
-          lastConversationType: preview.lastConversationType || row.mode,
+          lastConversationType:
+            preview.lastConversationType || row.active_mode || row.preferred_mode,
           updatedAt: toLocalDateTimeString(row.created_at_local || row.created_at),
           persona: row.persona_id
             ? {
@@ -490,7 +532,10 @@ const getConversationHistory = async (req, res, next) => {
             }
             : null,
           session: {
-            mode: row.mode,
+            mode: row.active_mode || row.preferred_mode,
+            preferredMode: row.preferred_mode,
+            activeMode: row.active_mode,
+            callLockedLanguage: row.call_locked_language,
             language: row.language_code
           }
         };
@@ -678,6 +723,120 @@ const getTtsCacheAudio = async (req, res, next) => {
   }
 };
 
+// ─── Call lifecycle ───────────────────────────────────────────────────────────
+// These endpoints MUST be called by the client before WS stream attach
+// and after WS stream detach. They are the single source of truth for
+// `active_mode` + `call_locked_language`.
+
+const startCall = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const sessionId = req.params.sessionId;
+    const { mode: rawMode, languageCode: rawLanguage } = req.body || {};
+    const mode = normalizeSessionMode(rawMode);
+    const languageCode = normalizeLanguageCode(rawLanguage);
+
+    if (mode !== 'voice_call' && mode !== 'video_call') {
+      return res.status(400).json({
+        success: false,
+        message: 'mode must be voice_call or video_call'
+      });
+    }
+    if (!languageCode || !SUPPORTED_SESSION_LANGUAGES.has(languageCode)) {
+      return res.status(400).json({
+        success: false,
+        message: `Unsupported languageCode. Supported values: ${[...SUPPORTED_SESSION_LANGUAGES].join(', ')}`
+      });
+    }
+
+    const owned = await ensureSessionOwnership({ sessionId, userId });
+    if (!owned) {
+      return res.status(404).json({
+        success: false,
+        message: 'Session not found'
+      });
+    }
+
+    // If a call is already active on this session, drop it cleanly first.
+    // Clients that reconnect without /call/end will still get a fresh lock.
+    await reconcileStaleCall(sessionId, { staleAfterMs: 0 });
+    clearSessionSpeech(sessionId);
+    clearRecentVariants(sessionId);
+
+    const session = await beginCallOnSession({ sessionId, language: languageCode, mode });
+
+    res.json({
+      success: true,
+      data: {
+        sessionId,
+        activeMode: session.activeMode,
+        callLockedLanguage: session.callLockedLanguage,
+        activeCallStartedAt: session.activeCallStartedAt
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const endCall = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const sessionId = req.params.sessionId;
+
+    const owned = await ensureSessionOwnership({ sessionId, userId });
+    if (!owned) {
+      return res.status(404).json({
+        success: false,
+        message: 'Session not found'
+      });
+    }
+
+    clearSessionSpeech(sessionId);
+    clearRecentVariants(sessionId);
+    const session = await endCallOnSession({ sessionId });
+
+    res.json({
+      success: true,
+      data: {
+        sessionId,
+        activeMode: session.activeMode,
+        callLockedLanguage: session.callLockedLanguage
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getSessionCallState = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const sessionId = req.params.sessionId;
+
+    const owned = await ensureSessionOwnership({ sessionId, userId });
+    if (!owned) {
+      return res.status(404).json({
+        success: false,
+        message: 'Session not found'
+      });
+    }
+
+    const state = await getCallState(sessionId);
+    res.json({
+      success: true,
+      data: state || {
+        activeMode: 'chat',
+        lockedLanguage: null,
+        activeCallStartedAt: null,
+        isCallActive: false
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 const getLiveTtsAudio = (req, res) => {
   const streamId = req.params.streamId;
   const token = req.query.token;
@@ -692,6 +851,50 @@ const getLiveTtsAudio = (req, res) => {
   attachLiveTtsStream({ id: streamId, token, res });
 };
 
+const getSessionFillerAudio = async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const sessionId = req.params.sessionId;
+
+    const owned = await ensureSessionOwnership({ sessionId, userId });
+    if (!owned) {
+      return res.status(404).json({
+        success: false,
+        message: 'Session not found'
+      });
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT persona_id, language_code, call_locked_language FROM ai_sessions WHERE id = ?`,
+      [sessionId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ success: false, message: 'Session not found' });
+    }
+
+    const sessionData = rows[0];
+    const languageCode = sessionData.call_locked_language || sessionData.language_code || 'en';
+    
+    const fillerManifest = await getFillerManifestForPersona(sessionData.persona_id, languageCode);
+    
+    // Convert to a format that the frontend can easily preload
+    // We only need the URLs for preloading. But we can send the whole objects for potential future use.
+    res.json({
+      success: true,
+      data: fillerManifest.map(f => ({
+        scenario: f.scenario,
+        variantIndex: f.variantIndex,
+        cdnUrl: f.cdnUrl,
+        durationMs: f.durationMs,
+        mouthCues: f.mouthCues
+      }))
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   createSession,
   listPersonas,
@@ -702,5 +905,9 @@ module.exports = {
   getConversationMessages,
   uploadImageAttachment,
   getTtsCacheAudio,
-  getLiveTtsAudio
+  getLiveTtsAudio,
+  startCall,
+  endCall,
+  getSessionCallState,
+  getSessionFillerAudio
 };

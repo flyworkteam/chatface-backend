@@ -1,3 +1,30 @@
+/**
+ * languageResolution.js — v2
+ *
+ * Responsibilities:
+ *   1. Detect the language of a user-authored message (text chat mode only).
+ *   2. Validate STT transcripts and reject the ones that are obvious
+ *      hallucinations, noise bursts, or mic echo that slipped past
+ *      echoGuard.
+ *
+ * Rewrite v2 changes vs v1:
+ *   - Added HALLUCINATION_PHRASES with per-language lists. We've seen
+ *     Whisper emit "Thank you for watching." / "presents." / short
+ *     Japanese/Korean filler when the mic is silent — these are
+ *     reality-check failures, not transcription errors.
+ *   - Short-clip rule: a "complete sentence" transcript from a clip
+ *     shorter than 800 ms is almost always hallucination. Reject.
+ *   - Strengthened repetition rule (unchanged behavior on hasExcessive
+ *     but added tokenized repetition for "the the the the").
+ *   - Locked-language validation is now *stricter* — during calls we
+ *     hard-require the detected language to match `call_locked_language`.
+ *     Soft-signal fallbacks are treated as mismatches, too, on the
+ *     assumption that a call locked to Turkish that suddenly produces
+ *     "Thank you for watching" is noise and should be dropped.
+ *
+ * See REWRITE_ARCHITECTURE.md §5.3.
+ */
+
 const {
   DEFAULT_LANGUAGE,
   SUPPORTED_SESSION_LANGUAGES,
@@ -33,6 +60,95 @@ const LANGUAGE_MARKERS = {
   pt: ['ola', 'olá', 'obrigado', 'obrigada', 'favor', 'sim', 'nao', 'não', 'como', 'voce', 'você', 'onde', 'quando', 'eu'],
   hi: ['namaste', 'haan', 'haanji', 'nahin', 'nahi', 'kaise', 'kya', 'main', 'aap', 'hum']
 };
+
+/**
+ * Known Whisper hallucination outputs on silence / low-SNR audio.
+ * Entries are substrings matched against normalized transcript.
+ * See DB incidents 2026-03-{11,14,19} — each of these was a mic-silent turn
+ * that produced a full-sentence transcript that went straight into LLM.
+ */
+const HALLUCINATION_PHRASES = {
+  en: [
+    'thank you for watching',
+    'thanks for watching',
+    'thank you for your attention',
+    "don't forget to subscribe",
+    'please subscribe',
+    'subscribe to my channel',
+    'see you in the next video',
+    'see you next time',
+    'like and subscribe',
+    'i love you',
+    'presents',
+    '.presents.',
+    '[ music ]',
+    '[music]',
+    'music playing',
+    'transcribed by',
+    'transcription by',
+    'subtitles by the amara',
+    'amara.org community'
+  ],
+  tr: [
+    'abone olmayı unutmayın',
+    'beğenmeyi unutmayın',
+    'izlediğiniz için teşekkürler',
+    'videoyu beğendiyseniz'
+  ],
+  de: [
+    'vielen dank fürs zuschauen',
+    'danke fürs zuschauen',
+    'abonniere meinen kanal'
+  ],
+  fr: [
+    "merci d'avoir regardé",
+    "n'oubliez pas de vous abonner",
+    'abonnez-vous'
+  ],
+  es: [
+    'gracias por ver',
+    'gracias por ver el video',
+    'suscríbete al canal'
+  ],
+  it: [
+    'grazie per aver guardato',
+    'iscriviti al canale'
+  ],
+  pt: [
+    'obrigado por assistir',
+    'inscreva-se no canal'
+  ],
+  ru: [
+    'спасибо за просмотр',
+    'подписывайтесь на канал'
+  ],
+  ja: [
+    'ご視聴ありがとうございました',
+    'チャンネル登録',
+    'ご視聴ありがとうございます'
+  ],
+  ko: [
+    '시청해주셔서 감사합니다',
+    '구독 부탁드립니다'
+  ],
+  zh: [
+    '感谢观看',
+    '请订阅',
+    '请订阅我的频道'
+  ],
+  hi: [
+    'देखने के लिए धन्यवाद',
+    'सब्सक्राइब'
+  ]
+};
+
+// Duration floor under which a "complete" sentence is suspicious.
+// Values chosen from observed hallucinations: all were emitted for audio
+// windows under 700 ms of real voice.
+const SHORT_CLIP_MS = 800;
+// Minimum tokens for a transcript to count as a "complete sentence" for the
+// short-clip rule.
+const COMPLETE_SENTENCE_MIN_TOKENS = 4;
 
 const normalizeText = (text = '') =>
   text
@@ -191,7 +307,7 @@ const resolveUserLanguage = ({ text, currentLanguage }) => {
 const getLetterLikeLength = (text = '') =>
   Array.from(text).filter((char) => /\p{L}|\p{N}/u.test(char)).length;
 
-const hasExcessiveRepetition = (text = '') => {
+const hasExcessiveCharRepetition = (text = '') => {
   const normalized = text.replace(/\s+/g, '');
   if (!normalized) {
     return false;
@@ -200,7 +316,75 @@ const hasExcessiveRepetition = (text = '') => {
   return uniqueChars.size <= 2 && normalized.length >= 6;
 };
 
-const validateTranscript = ({ text, metadata, currentLanguage, lockedLanguage = null }) => {
+const hasExcessiveTokenRepetition = (text = '') => {
+  const tokens = tokenize(text);
+  if (tokens.length < 4) {
+    return false;
+  }
+  const counts = new Map();
+  tokens.forEach((token) => {
+    counts.set(token, (counts.get(token) || 0) + 1);
+  });
+  for (const count of counts.values()) {
+    if (count >= 4 && count / tokens.length >= 0.5) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const matchesHallucinationPhrase = (text = '', language = null) => {
+  const normalized = normalizeText(text);
+  if (!normalized) {
+    return null;
+  }
+  const langsToCheck = language
+    ? [language, 'en'].filter((value, idx, arr) => value && arr.indexOf(value) === idx)
+    : Object.keys(HALLUCINATION_PHRASES);
+  for (const lang of langsToCheck) {
+    const bucket = HALLUCINATION_PHRASES[lang] || [];
+    for (const phrase of bucket) {
+      const target = normalizeText(phrase);
+      if (!target) {
+        continue;
+      }
+      if (normalized === target || normalized.includes(target)) {
+        return { phrase, language: lang };
+      }
+    }
+  }
+  return null;
+};
+
+const isLikelyCompleteSentence = (text = '') => {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const endsWithTerminator = /[.!?。!?…]$/.test(trimmed);
+  const tokenCount = tokenize(trimmed).length;
+  return endsWithTerminator && tokenCount >= COMPLETE_SENTENCE_MIN_TOKENS;
+};
+
+/**
+ * Validate a finalized STT transcript. Returns { accepted: bool, reason?, ... }.
+ *
+ * @param {object} params
+ * @param {string} params.text
+ * @param {object} [params.metadata]           Shape: { confidence, durationMs, ... }
+ * @param {string} [params.currentLanguage]    Session's current language.
+ * @param {string|null} [params.lockedLanguage] call_locked_language if active.
+ * @param {number} [params.audioMsReceived]    ms of audio seen for this turn.
+ * @param {boolean} [params.duringAssistantSpeech] Whether TTS was active.
+ */
+const validateTranscript = ({
+  text,
+  metadata,
+  currentLanguage,
+  lockedLanguage = null,
+  audioMsReceived = null,
+  duringAssistantSpeech = false
+}) => {
   const trimmed = typeof text === 'string' ? text.trim() : '';
   if (!trimmed) {
     return { accepted: false, reason: 'empty' };
@@ -216,28 +400,78 @@ const validateTranscript = ({ text, metadata, currentLanguage, lockedLanguage = 
     return { accepted: false, reason: 'too_short', confidence };
   }
 
-  if (hasExcessiveRepetition(trimmed)) {
+  if (hasExcessiveCharRepetition(trimmed) || hasExcessiveTokenRepetition(trimmed)) {
     return { accepted: false, reason: 'repetitive_noise', confidence };
+  }
+
+  const normalizedLocked = lockedLanguage
+    ? normalizeLanguageCode(lockedLanguage, null)
+    : null;
+
+  // Hallucination phrase check — run early, before any language arithmetic.
+  // During active assistant speech or locked calls, match against the locked
+  // language + English. Otherwise broad-sweep.
+  const hallucinationMatch = matchesHallucinationPhrase(
+    trimmed,
+    normalizedLocked || currentLanguage
+  );
+  if (hallucinationMatch) {
+    return {
+      accepted: false,
+      reason: 'known_hallucination',
+      confidence,
+      hallucination: hallucinationMatch
+    };
+  }
+
+  // Short-clip hallucination rule: a "complete sentence" from <800ms of audio
+  // is almost always Whisper filling in the blanks.
+  if (
+    Number.isFinite(audioMsReceived) &&
+    audioMsReceived > 0 &&
+    audioMsReceived < SHORT_CLIP_MS &&
+    isLikelyCompleteSentence(trimmed)
+  ) {
+    return {
+      accepted: false,
+      reason: 'short_clip_sentence',
+      confidence,
+      audioMsReceived
+    };
   }
 
   const resolution = resolveUserLanguage({ text: trimmed, currentLanguage });
   const normalizedCurrent = normalizeLanguageCode(currentLanguage, DEFAULT_LANGUAGE);
-  const normalizedLocked = lockedLanguage
-    ? normalizeLanguageCode(lockedLanguage, null)
-    : null;
   const tokenCount = tokenize(trimmed).length;
 
-  if (
-    normalizedLocked &&
-    resolution.language !== normalizedLocked &&
-    resolution.source !== 'fallback'
-  ) {
-    return {
-      accepted: false,
-      reason: 'locked_language_mismatch',
-      confidence,
-      resolution
-    };
+  // Locked-language validation (call mode): transcripts that don't match
+  // the locked language must be rejected. Fallback-source resolutions
+  // (ASCII passthrough / ambiguous) are allowed *only* if we can't rule
+  // them out — i.e., the transcript is too short to have a signal. If the
+  // resolver has evidence of another language (script or keywords), drop.
+  if (normalizedLocked) {
+    const resolvedLang = resolution.language;
+    const isScriptOrKeyword = resolution.source === 'script' || resolution.source === 'keywords';
+    if (isScriptOrKeyword && resolvedLang !== normalizedLocked) {
+      return {
+        accepted: false,
+        reason: 'locked_language_mismatch',
+        confidence,
+        resolution,
+        lockedLanguage: normalizedLocked
+      };
+    }
+    // If assistant is speaking and transcript is short/fragment — during
+    // locked call that's echo or noise, not a user turn.
+    if (duringAssistantSpeech && contentLength < 10) {
+      return {
+        accepted: false,
+        reason: 'short_during_locked_speech',
+        confidence,
+        resolution,
+        lockedLanguage: normalizedLocked
+      };
+    }
   }
 
   if (resolution.source === 'script' && resolution.supported === false) {
@@ -299,6 +533,9 @@ const validateTranscript = ({ text, metadata, currentLanguage, lockedLanguage = 
 
 module.exports = {
   SUPPORTED_SESSION_LANGUAGES,
+  HALLUCINATION_PHRASES,
   resolveUserLanguage,
-  validateTranscript
+  validateTranscript,
+  matchesHallucinationPhrase,
+  isLikelyCompleteSentence
 };

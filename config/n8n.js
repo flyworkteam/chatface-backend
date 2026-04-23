@@ -19,7 +19,9 @@ const n8nConfig = {
     moderationCheck: '/moderation-check',
     aiTurnAnalytics: '/ai-turn-analytics',
     ttsCacheWarmer: '/tts-cache-warmer',
-    personaConfig: '/persona-config'
+    personaConfig: '/persona-config',
+    fillerAudio: '/filler-audio',
+    memorySync: '/memory-sync'
   }
 };
 

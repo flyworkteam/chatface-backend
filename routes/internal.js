@@ -14,6 +14,7 @@ const {
   handleLlmSentenceCallback,
   handleLlmDoneCallback,
   handleLlmErrorCallback,
+  pingTurn,
   getPendingTurnCount
 } = require('../services/ai/n8nLlmAdapter');
 const { primeTransientAudio } = require('../services/ai/ttsCacheService');
@@ -23,6 +24,14 @@ const {
   runN8nStartupSmokeChecks,
   validateNodeInternalBaseUrl
 } = require('../config/n8n');
+const { saveFillerAudio } = require('../services/ai/fillerAudioService');
+const {
+  getPendingSessionsForSummary,
+  saveMemorySummary,
+  saveMemoryEntry,
+  fetchMessagesAfterId,
+  getLatestMemorySummary
+} = require('../services/ai/memoryRepository');
 
 const SMOKE_TIMEOUT_MS = parseInt(process.env.N8N_SMOKE_TIMEOUT_MS || '6000', 10);
 const CALLBACK_PATH_PREFIX =
@@ -93,6 +102,20 @@ router.post('/llm-done', (req, res) => {
 });
 
 /**
+ * n8n posts here every ~2s while the LLM is thinking, as a liveness
+ * signal. Resets the heartbeat-grace timeout so long-but-alive generations
+ * don't get killed by the stall detector. Body: { turnId, stage? }
+ */
+router.post('/llm-heartbeat', (req, res) => {
+  const { turnId } = req.body || {};
+  if (!turnId) {
+    return res.status(400).json({ error: 'turnId required' });
+  }
+  pingTurn(turnId);
+  res.sendStatus(204);
+});
+
+/**
  * n8n posts here if the LLM workflow encounters an error.
  * Body: { turnId, message }
  */
@@ -127,7 +150,111 @@ router.post('/prime-cache', (req, res) => {
   }
 });
 
-// ── Phase 4: Async moderation/cache warmer callbacks ──────────────────────
+// ── Phase 4: Async memory summarization ────────────────────────────────────
+
+/**
+ * n8n workflow fetches sessions that have grown too large and need a summary.
+ */
+router.get('/memory/pending', async (req, res) => {
+  try {
+    const threshold = parseInt(req.query.threshold || '10', 10);
+    const sessions = await getPendingSessionsForSummary(threshold);
+    
+    // For each session, fetch the new messages to be summarized
+    const pendingData = [];
+    for (const session of sessions) {
+      const messages = await fetchMessagesAfterId(
+        session.session_id,
+        session.last_summary_message_id || null,
+        50
+      );
+      const latestSummary = await getLatestMemorySummary(session.session_id);
+      
+      pendingData.push({
+        sessionId: session.session_id,
+        userId: session.user_id,
+        newMessagesCount: session.new_msg_count,
+        lastMessageId: session.last_msg_id,
+        messages: messages.map(m => ({
+          id: m.id,
+          role: m.role,
+          content: m.content
+        })),
+        previousSummary: latestSummary ? latestSummary.summary : null
+      });
+    }
+
+    res.json({ pending: pendingData });
+  } catch (err) {
+    warn('Failed to fetch pending memory sessions', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * n8n workflow saves the new summary back here.
+ */
+router.post('/memory/summary', async (req, res) => {
+  const { sessionId, summary, lastMessageId } = req.body || {};
+  if (!sessionId || !summary || !lastMessageId) {
+    return res.status(400).json({ error: 'sessionId, summary, and lastMessageId required' });
+  }
+  try {
+    await saveMemorySummary({ sessionId, summary, lastMessageId });
+    log('Memory summary updated via n8n', { sessionId, lastMessageId });
+    res.sendStatus(200);
+  } catch (err) {
+    warn('Failed to save memory summary from n8n', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * n8n workflow saves extracted entities (facts, preferences).
+ */
+router.post('/memory/entries', async (req, res) => {
+  const { userId, type, languageCode, valueJson, embedding, salience } = req.body || {};
+  if (!userId || !type || !valueJson) {
+    return res.status(400).json({ error: 'userId, type, and valueJson required' });
+  }
+  try {
+    const id = await saveMemoryEntry({ userId, type, languageCode, valueJson, embedding, salience });
+    log('Memory entry added via n8n', { userId, type, entryId: id });
+    res.sendStatus(200);
+  } catch (err) {
+    warn('Failed to save memory entry from n8n', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * n8n workflow saves newly rendered filler audio.
+ */
+router.post('/filler-audio/cache', async (req, res) => {
+  const { personaId, languageCode, scenario, variantIndex, text, cdnUrl, durationMs, mouthCuesJson } = req.body || {};
+  if (!personaId || !languageCode || !scenario || variantIndex === undefined || !cdnUrl) {
+    return res.status(400).json({ error: 'Missing required filler audio fields' });
+  }
+  try {
+    await saveFillerAudio({
+      personaId,
+      languageCode,
+      scenario,
+      variantIndex,
+      text: text || '',
+      cdnUrl,
+      durationMs: durationMs || 0,
+      mouthCuesJson: mouthCuesJson ? JSON.stringify(mouthCuesJson) : '[]'
+    });
+    log('Filler audio cache updated via n8n', { personaId, scenario, variantIndex });
+    res.sendStatus(200);
+  } catch (err) {
+    warn('Failed to save filler audio from n8n', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Phase 5: Async moderation/cache warmer callbacks ──────────────────────
 
 /**
  * Optional callback endpoint used by n8n moderation-check workflow.

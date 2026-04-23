@@ -1,0 +1,446 @@
+{
+  "name": "chatface-all-workflows",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ai-chat",
+        "options": {
+          "responseData": "noData"
+        }
+      },
+      "id": "b7da0729-c4e5-493c-8f78-3edc1ce45794",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        14368,
+        6928
+      ],
+      "webhookId": "chatface-ai-chat"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ChatFace ai-chat workflow (n8n-safe)\n// Uses only this.helpers.httpRequest (no global fetch/process/env).\n\nconst first = $input.first();\nconst body = first?.json?.body ?? first?.json ?? {};\n\nif (body.healthcheck) {\n  return [{ json: { ok: true, workflow: 'ai-chat', version: 'v3' } }];\n}\n\nconst turnId = body.turnId;\nconst systemPrompt = body.systemPrompt ?? '';\nconst messages = Array.isArray(body.messages) ? body.messages : [];\nconst mode = body.mode ?? 'chat';\nconst sentenceCallbackUrl = body.sentenceCallbackUrl;\nconst heartbeatCallbackUrl = body.heartbeatCallbackUrl;\nconst doneCallbackUrl = body.doneCallbackUrl;\nconst errorCallbackUrl = body.errorCallbackUrl;\n\nif (!turnId || !sentenceCallbackUrl || !doneCallbackUrl) {\n  throw new Error('Missing required fields: turnId, sentenceCallbackUrl, doneCallbackUrl');\n}\n\nconst openAiKey = body.openAiKey;\nif (!openAiKey) {\n  throw new Error('openAiKey is required in request body');\n}\n\nconst model = body.openAiModel ?? 'gpt-4o-mini';\nconst isVoice = mode === 'voice_call' || mode === 'video_call';\nconst maxTokens = isVoice ? 280 : 1024;\n\nconst fireCallback = async (url, payload) => {\n  if (!url) return;\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify(payload),\n      timeout: 6000,\n    });\n  } catch (_err) {\n    // Callback errors must not break generation flow.\n  }\n};\n\nconst openAiMessages = [];\nif (systemPrompt) {\n  openAiMessages.push({ role: 'system', content: systemPrompt });\n}\nfor (const msg of messages) {\n  const parts = Array.isArray(msg?.content) ? msg.content : [];\n  const text = parts\n    .filter((p) => ['text', 'input_text', 'output_text'].includes(p?.type))\n    .map((p) => p?.text ?? '')\n    .join('');\n  if (text.trim()) {\n    openAiMessages.push({ role: msg?.role ?? 'user', content: text });\n  }\n}\n\nconst splitIntoSentences = (rawText) => {\n  const text = String(rawText ?? '').trim();\n  if (!text) return [];\n\n  const PLACEHOLDER = '\\uE000';\n  const protectedText = text\n    .replace(/\\.{2,}/g, (m) => PLACEHOLDER.repeat(m.length))\n    .replace(/(\\d)\\.(\\d)/g, `$1${PLACEHOLDER}$2`)\n    .replace(\n      /\\b(Dr|Mr|Mrs|Ms|Prof|Sr|Jr|St|vs|etc|Inc|Ltd|Corp|No|Vol|Dept|approx|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\./gi,\n      (m) => m.slice(0, -1) + PLACEHOLDER,\n    );\n\n  const out = [];\n  const boundaryRegex = /[.!?。！？…](?:[)\\]\"'”’]+)?(?=\\s|$)/g;\n  let cursor = 0;\n  let match;\n\n  while ((match = boundaryRegex.exec(protectedText)) !== null) {\n    const end = match.index + match[0].length;\n    const part = protectedText\n      .slice(cursor, end)\n      .replace(new RegExp(PLACEHOLDER, 'g'), '.')\n      .trim();\n    if (part.length >= 4 && /[\\p{L}\\p{N}]/u.test(part)) {\n      out.push(part);\n    }\n    cursor = end;\n  }\n\n  const tail = protectedText\n    .slice(cursor)\n    .replace(new RegExp(PLACEHOLDER, 'g'), '.')\n    .trim();\n  if (tail.length >= 4 && /[\\p{L}\\p{N}]/u.test(tail)) {\n    out.push(tail);\n  }\n\n  if (!out.length && /[\\p{L}\\p{N}]/u.test(text)) {\n    out.push(text);\n  }\n\n  return out;\n};\n\nawait fireCallback(heartbeatCallbackUrl, { turnId, stage: 'started' });\n\nlet openAiResult;\ntry {\n  openAiResult = await this.helpers.httpRequest({\n    method: 'POST',\n    url: 'https://api.openai.com/v1/chat/completions',\n    headers: {\n      'Content-Type': 'application/json',\n      Authorization: `Bearer ${openAiKey}`,\n    },\n    body: JSON.stringify({\n      model,\n      messages: openAiMessages,\n      max_tokens: maxTokens,\n      temperature: isVoice ? 0.75 : 0.7,\n      top_p: 0.9,\n      stream: false,\n    }),\n    timeout: 60000,\n  });\n} catch (err) {\n  await fireCallback(errorCallbackUrl, {\n    turnId,\n    message: err?.message ?? 'OpenAI request failed',\n  });\n  throw err;\n}\n\nconst fullText = String(openAiResult?.choices?.[0]?.message?.content ?? '').trim();\nconst tokensIn = Number(openAiResult?.usage?.prompt_tokens ?? 0);\nconst tokensOut = Number(openAiResult?.usage?.completion_tokens ?? 0);\n\nconst sentences = splitIntoSentences(fullText);\nfor (let i = 0; i < sentences.length; i += 1) {\n  await fireCallback(sentenceCallbackUrl, {\n    turnId,\n    sentence: sentences[i],\n    index: i,\n  });\n\n  if (heartbeatCallbackUrl && (i === 0 || i % 2 === 1)) {\n    await fireCallback(heartbeatCallbackUrl, {\n      turnId,\n      stage: 'dispatching',\n      index: i,\n    });\n  }\n}\n\nawait fireCallback(doneCallbackUrl, {\n  turnId,\n  fullText,\n  tokensIn,\n  tokensOut,\n});\n\nreturn [{\n  json: {\n    turnId,\n    sentCount: sentences.length,\n    tokensIn,\n    tokensOut,\n    status: 'done',\n  },\n}];\n"
+      },
+      "id": "e5540f25-9e9c-4922-945c-59a96fc55315",
+      "name": "Call OpenAI + Fire Callbacks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14640,
+        6928
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── ChatFace v2: ai-turn-analytics workflow ────────────────────────────\n// Logs every AI turn's latency data for observability.\n// v2: extended `meta_json` with STT, echo, filler, and n8n-LLM fields.\n//\n// Required n8n credential: MySQL ('ChatFace DB')\n\nconst body = $input.first().json.body ?? $input.first().json;\nconst timings = body.timings ?? {};\n\nconst totalMs = timings.totalMs ?? body.latencyMs ?? 0;\nconst isSlow     = totalMs > 2500;\nconst isVerySlow = totalMs > 4500;\n\nconst meta = {\n  // STT\n  sttLang: body.sttLang ?? null,\n  sttConfidence: body.sttConfidence ?? null,\n  sttRejectionReason: body.sttRejectionReason ?? null,\n  // Echo / filler\n  echoRejected: body.echoRejected ?? null,\n  echoScoreTokenOverlap: body.echoScoreTokenOverlap ?? null,\n  echoScoreBigram: body.echoScoreBigram ?? null,\n  fillerTriggered: Array.isArray(body.fillerTriggered) ? body.fillerTriggered : null,\n  // n8n LLM\n  n8nLlmFirstSentenceMs: timings.firstSentenceMs ?? null,\n  n8nLlmTotalMs: timings.totalMs ?? null,\n  n8nLlmRetries: body.n8nCallRetries ?? null,\n  n8nCallStatus: body.n8nCallStatus ?? null,\n  // TTS\n  ttsFirstChunkMs: timings.firstAudioMs ?? null,\n  ttsTotalMs: body.ttsTotalMs ?? null,\n  ttsCacheHit: body.ttsCacheHit ?? null,\n  // Language lock\n  lockedLanguage: body.lockedLanguage ?? null\n};\n\nreturn [{\n  json: {\n    sessionId:       body.sessionId      ?? null,\n    userId:          body.userId         ?? null,\n    personaId:       body.personaId      ?? null,\n    mode:            body.mode           ?? 'chat',\n    language:        body.language       ?? null,\n    llmIn:           body.llmIn          ?? 0,\n    llmOut:          body.llmOut         ?? 0,\n    ttsChars:        body.ttsChars       ?? 0,\n    latencyMs:       body.latencyMs      ?? 0,\n    prepMs:          timings.prepMs      ?? 0,\n    llmFirstTokenMs: timings.llmFirstTokenMs ?? 0,\n    firstSentenceMs: timings.firstSentenceMs ?? 0,\n    moderationMs:    timings.moderationMs ?? 0,\n    totalMs,\n    viaN8nLlm:       body.viaN8nLlm      ? 1 : 0,\n    isSlow:          isSlow              ? 1 : 0,\n    isVerySlow:      isVerySlow          ? 1 : 0,\n    meta_json:        JSON.stringify(meta),\n    createdAt:       body.timestamp      ?? new Date().toISOString()\n  }\n}];"
+      },
+      "id": "d33d6bd3-fb94-4672-839e-8c962fadfe4e",
+      "name": "Process",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14592,
+        7104
+      ]
+    },
+    {
+      "parameters": {
+        "table": "ai_turn_analytics",
+        "options": {}
+      },
+      "id": "92a8a5e4-8c47-4c79-8cbc-b17552651e33",
+      "name": "Insert to DB",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2,
+      "position": [
+        14816,
+        7104
+      ],
+      "credentials": {
+        "mySql": {
+          "id": "7xG2soQ4TrQZFni3",
+          "name": "MySQL account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ai-turn-analytics",
+        "options": {
+          "responseData": "noData"
+        }
+      },
+      "id": "e29d6454-f71c-4617-bed0-04ae9dc0a9fe",
+      "name": "Webhook1",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        14368,
+        7104
+      ],
+      "webhookId": "chatface-ai-turn-analytics"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── ChatFace v2: moderation-check workflow ─────────────────────────────\n// Runs fully async (fire-and-forget from Node). Posts a callback only when\n// the result is blocked — Node auto-allows if no callback arrives in time.\n\nconst body = $input.first().json.body ?? $input.first().json;\nconst text = body.text ?? '';\nconst openAiKey = body.openAiKey;\n\nif (!text || !openAiKey) {\n  return [{ json: { blocked: false, skipped: true, reason: 'missing_text_or_key' } }];\n}\n\nlet result = { flagged: false, categories: {}, category_scores: {} };\ntry {\n  const response = await this.helpers.httpRequest({\n    method: 'POST',\n    url: 'https://api.openai.com/v1/moderations',\n    headers: {\n      'Content-Type': 'application/json',\n      Authorization: `Bearer ${openAiKey}`\n    },\n    body: JSON.stringify({\n      model: body.model ?? 'omni-moderation-latest',\n      input: text\n    })\n  });\n  result = response?.results?.[0] ?? result;\n} catch (err) {\n  return [{ json: { blocked: false, degraded: true, reason: err.message } }];\n}\n\nconst categories = result.categories || {};\nconst flaggedCategories = Object.entries(categories)\n  .filter(([, isFlagged]) => Boolean(isFlagged))\n  .map(([name]) => name);\nconst blocked = Boolean(result.flagged);\nconst reason = flaggedCategories.join(', ') || 'content_policy';\n\nif (blocked && body.callbackUrl) {\n  await this.helpers.httpRequest({\n    method: 'POST',\n    url: body.callbackUrl,\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify({\n      sessionId: body.sessionId ?? null,\n      userId: body.userId ?? null,\n      turnId: body.turnId ?? null,\n      blocked: true,\n      reason,\n      flaggedCategories\n    })\n  }).catch(() => {});\n}\n\nreturn [{\n  json: {\n    blocked,\n    reason,\n    flaggedCategories,\n    categoryScores: result.category_scores || {},\n    sessionId: body.sessionId ?? null,\n    userId: body.userId ?? null,\n    turnId: body.turnId ?? null,\n    createdAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "80eb9ebf-0ec7-4bde-afb7-0ee32c5cda74",
+      "name": "Moderate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14656,
+        7296
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "moderation-check",
+        "options": {
+          "responseData": "noData"
+        }
+      },
+      "id": "abfa26c0-8e39-4f5f-8607-ddef24d8cb0e",
+      "name": "Webhook2",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        14368,
+        7296
+      ],
+      "webhookId": "chatface-moderation-check"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── ChatFace v2: tts-synthesize workflow ───────────────────────────────\n// Calls ElevenLabs with per-request voice settings (persona-driven).\n// Same webhook, same response shape. Adds pooled keep-alive to reduce\n// handshake time across back-to-back synth calls.\n\nconst bodyHealth = $input.first().json.body ?? $input.first().json;\nif (bodyHealth.healthcheck) {\n  return [{ json: { ok: true, workflow: 'tts-synthesize', version: 'v2' } }];\n}\n\nconst body = bodyHealth;\nconst voiceId = body.voice_id ?? body.voiceId;\nif (!voiceId) throw new Error('voiceId is required');\nif (!body.text) throw new Error('text is required');\n\nconst elevenLabsKey = body.elevenLabsKey;\nif (!elevenLabsKey) throw new Error('elevenLabsKey is required in request body');\n\nconst payload = {\n  text: body.text,\n  model_id: body.model_id ?? 'eleven_flash_v2_5',\n  voice_settings: body.voice_settings ?? {\n    stability: 0.72,\n    similarity_boost: 0.8,\n    style: 0.08,\n    use_speaker_boost: true\n  },\n  optimize_streaming_latency: body.optimize_streaming_latency ?? 4,\n  output_format: body.output_format ?? 'mp3_22050_32'\n};\n\nif (body.language_code) payload.language_code = body.language_code;\nif (body.previous_text) payload.previous_text = body.previous_text;\nif (body.next_text) payload.next_text = body.next_text;\nif (body.apply_text_normalization) payload.apply_text_normalization = body.apply_text_normalization;\nif (Array.isArray(body.pronunciation_dictionary_locators) && body.pronunciation_dictionary_locators.length) {\n  payload.pronunciation_dictionary_locators = body.pronunciation_dictionary_locators;\n}\n\nconst audioBuffer = await this.helpers.httpRequest({\n  method: 'POST',\n  url: `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,\n  headers: {\n    'Content-Type': 'application/json',\n    'xi-api-key': elevenLabsKey\n  },\n  body: JSON.stringify(payload),\n  encoding: 'arraybuffer',\n  returnFullResponse: false,\n  timeout: 30000\n});\n\nconst base64Audio = Buffer.from(audioBuffer).toString('base64');\n\nreturn [{ json: { base64Audio } }];"
+      },
+      "id": "36f654f1-0dae-48a7-a9c7-7c9ef462f91a",
+      "name": "Call ElevenLabs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        15248,
+        7296
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "tts-synthesize",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a3999089-011d-4706-ad8b-090790b33177",
+      "name": "Webhook4",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        14976,
+        7296
+      ],
+      "webhookId": "chatface-tts-synthesize"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"audio\": $json.base64Audio } }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "id": "dbe69f02-1ca0-4839-bc75-35aceb5f18c4",
+      "name": "Respond to Webhook1",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        15504,
+        7296
+      ]
+    },
+    {
+      "parameters": {
+        "path": "persona-config/:personaId",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "fce56db7-480b-49f3-b305-a75720693b37",
+      "name": "Webhook3",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        14368,
+        7488
+      ],
+      "webhookId": "chatface-persona-config"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "id": "69a55e0d-1f55-41e8-a34b-c2dff6e66685",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        14896,
+        7488
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── ChatFace v2: persona-config workflow ───────────────────────────────\n// Returns managed persona prompts for Node.js contextBuilder. If no override\n// is registered in workflow static data, returns the default prompt so the\n// builder falls back gracefully.\n\nconst input = $input.first().json;\nconst personaId = input?.params?.personaId || input?.personaId || null;\nconst staticData = $getWorkflowStaticData('global');\nconst prompts = staticData.personaPrompts || {};\nconst defaultPrompt = prompts.default || '';\nconst systemPrompt = (personaId && prompts[personaId]) ? prompts[personaId] : defaultPrompt;\n\nreturn [{ json: { personaId, systemPrompt } }];"
+      },
+      "id": "bd7206a0-d040-48a3-adef-1a001aebf854",
+      "name": "Resolve Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14656,
+        7488
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "filler-audio",
+        "options": {
+          "responseData": "noData"
+        }
+      },
+      "id": "c91a0f52-5410-4e1d-9ce1-f12a37d7d4a1",
+      "name": "Webhook5",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        14368,
+        7680
+      ],
+      "webhookId": "chatface-filler-audio"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── ChatFace v2: filler-audio pre-render workflow ──────────────────────\n// Triggered by Node on persona create / update. Iterates the manifest\n// (persona × language × scenario × variant), calls tts-synthesize, uploads\n// to BunnyCDN, and writes rows into filler_audio_cache via Node callback.\n// Failure of one item must not poison the batch.\n//\n// Body from Node:\n//   {\n//     personaId, voiceId, styleTag,\n//     manifest: [{ personaId, language, scenario, variantIndex, text }...],\n//     elevenLabsKey,\n//     ttsWebhookUrl,\n//     bunnyStorageZone, bunnyAccessKey, bunnyCdnHost, bunnyPathPrefix,\n//     intakeCallbackUrl  // Node route that persists cache rows\n//   }\n\nconst body = $input.first().json.body ?? $input.first().json;\nif (body.healthcheck) {\n  return [{ json: { ok: true, workflow: 'filler-audio', version: 'v3' } }];\n}\n\nconst {\n  personaId,\n  voiceId,\n  styleTag,\n  manifest,\n  elevenLabsKey,\n  ttsWebhookUrl,\n  bunnyStorageZone,\n  bunnyAccessKey,\n  bunnyCdnHost,\n  bunnyPathPrefix,\n  intakeCallbackUrl\n} = body;\n\nif (!personaId || !voiceId || !Array.isArray(manifest) || !ttsWebhookUrl || !intakeCallbackUrl) {\n  throw new Error('filler-audio: required fields missing');\n}\nif (!bunnyStorageZone || !bunnyAccessKey || !bunnyCdnHost) {\n  throw new Error('filler-audio: BunnyCDN credentials missing');\n}\n\nconst prefix = (bunnyPathPrefix || 'fillers').replace(/^\\/+|\\/+$/g, '');\nconst voiceSettings = {\n  stability: 0.72,\n  similarity_boost: 0.85,\n  style: styleTag === 'playful' ? 0.3 : styleTag === 'concerned' ? 0.12 : 0.08,\n  use_speaker_boost: true\n};\n\nconst results = [];\nconst errors = [];\n\nfor (const item of manifest) {\n  try {\n    // 1) Synthesize via the shared tts-synthesize webhook.\n    const synth = await this.helpers.httpRequest({\n      method: 'POST',\n      url: ttsWebhookUrl,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({\n        voice_id: voiceId,\n        text: item.text,\n        model_id: 'eleven_flash_v2_5',\n        output_format: 'mp3_22050_32',\n        optimize_streaming_latency: 4,\n        language_code: item.language,\n        voice_settings: voiceSettings,\n        elevenLabsKey\n      }),\n      timeout: 30000\n    });\n\n    const audioBase64 = synth?.audio || synth?.base64Audio;\n    if (!audioBase64) throw new Error('tts returned no audio');\n\n    const audioBuffer = Buffer.from(audioBase64, 'base64');\n    const durationMs = Math.max(400, Math.round((audioBuffer.length / 4000) * 1000));\n\n    // 2) Upload to BunnyCDN.\n    const objectKey = `${prefix}/${personaId}/${item.language}/${item.scenario}-${item.variantIndex}.mp3`;\n    const cdnUrl = `https://${bunnyCdnHost}/${objectKey}`;\n\n    await this.helpers.httpRequest({\n      method: 'PUT',\n      url: `https://storage.bunnycdn.com/${bunnyStorageZone}/${objectKey}`,\n      headers: {\n        AccessKey: bunnyAccessKey,\n        'Content-Type': 'audio/mpeg'\n      },\n      body: audioBuffer,\n      timeout: 30000\n    });\n\n    // 3) Persist one row per clip to Node intake endpoint.\n    const rowPayload = {\n      personaId: item.personaId || personaId,\n      languageCode: item.language,\n      scenario: item.scenario,\n      variantIndex: item.variantIndex,\n      text: item.text,\n      cdnUrl,\n      durationMs,\n      mouthCuesJson: []\n    };\n\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: intakeCallbackUrl,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify(rowPayload),\n      timeout: 15000\n    });\n\n    results.push(rowPayload);\n  } catch (err) {\n    errors.push({\n      personaId: item.personaId || personaId,\n      languageCode: item.language,\n      scenario: item.scenario,\n      variantIndex: item.variantIndex,\n      error: err.message\n    });\n  }\n}\n\nreturn [{\n  json: {\n    personaId,\n    rendered: results.length,\n    failed: errors.length,\n    errors\n  }\n}];"
+      },
+      "id": "8a3b4c55-9a71-4b1d-bf44-fbe7f4e8a0b2",
+      "name": "Render Filler Audio",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14640,
+        7680
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "memory-sync",
+        "options": {
+          "responseData": "noData"
+        }
+      },
+      "id": "f3f8aee0-a757-4fc4-aa9d-5ec9f6f3d2b7",
+      "name": "Webhook Memory Sync",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        14368,
+        7872
+      ],
+      "webhookId": "chatface-memory-sync"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ChatFace memory-sync workflow (n8n-safe)\n// No process/env usage. Configuration comes from request body, with static fallbacks.\n\nconst first = $input.first();\nconst body = first?.json?.body ?? first?.json ?? {};\n\nif (body.healthcheck) {\n  return [{ json: { ok: true, workflow: 'memory-sync', version: 'v2' } }];\n}\n\nconst STATIC_CONFIG = {\n  nodeInternalBaseUrl: 'http://localhost:3000',\n  openAiKey: '',\n  openAiModel: 'gpt-4o-mini',\n  threshold: 10,\n  maxSessions: 20,\n  maxEntriesPerSession: 5,\n  memoryType: 'long_term',\n  languageCode: 'en',\n  dryRun: false,\n};\n\nconst nodeInternalBaseUrl = String(\n  body.nodeInternalBaseUrl ?? STATIC_CONFIG.nodeInternalBaseUrl ?? '',\n).trim().replace(/\\/+$/, '');\n\nif (!nodeInternalBaseUrl) {\n  throw new Error('memory-sync: nodeInternalBaseUrl is required (body.nodeInternalBaseUrl or STATIC_CONFIG.nodeInternalBaseUrl)');\n}\n\nconst openAiKey = String(body.openAiKey ?? STATIC_CONFIG.openAiKey ?? '').trim();\nif (!openAiKey) {\n  throw new Error('memory-sync: openAiKey is required (body.openAiKey or STATIC_CONFIG.openAiKey)');\n}\n\nconst openAiModel = body.openAiModel ?? STATIC_CONFIG.openAiModel;\nconst threshold = Math.max(1, Number(body.threshold ?? STATIC_CONFIG.threshold));\nconst maxSessions = Math.max(1, Number(body.maxSessions ?? STATIC_CONFIG.maxSessions));\nconst maxEntriesPerSession = Math.max(0, Number(body.maxEntriesPerSession ?? STATIC_CONFIG.maxEntriesPerSession));\nconst defaultMemoryType = body.memoryType ?? STATIC_CONFIG.memoryType;\nconst defaultLanguageCode = body.languageCode ?? STATIC_CONFIG.languageCode;\nconst dryRun = Boolean(body.dryRun ?? STATIC_CONFIG.dryRun);\n\nconst toText = (value) => {\n  if (typeof value === 'string') return value.trim();\n  if (value === null || value === undefined) return '';\n  try {\n    return JSON.stringify(value);\n  } catch (_err) {\n    return String(value);\n  }\n};\n\nconst extractMessageText = (content) => {\n  if (Array.isArray(content)) {\n    const text = content\n      .map((part) => toText(part?.text || part?.content || ''))\n      .filter(Boolean)\n      .join(' ')\n      .trim();\n    return text || '[non-text message]';\n  }\n\n  if (content && typeof content === 'object') {\n    const text = toText(content.text || '');\n    if (text) return text;\n    const attachmentCount = Array.isArray(content.attachments) ? content.attachments.length : 0;\n    return attachmentCount ? `[${attachmentCount} attachment(s)]` : '[structured message]';\n  }\n\n  return toText(content) || '[empty]';\n};\n\nconst parseJsonLike = (raw) => {\n  if (!raw || typeof raw !== 'string') return null;\n  const direct = raw.trim();\n\n  try {\n    return JSON.parse(direct);\n  } catch (_err) {}\n\n  const fenced = direct.match(/```(?:json)?\\s*([\\s\\S]*?)```/i);\n  if (fenced && fenced[1]) {\n    try {\n      return JSON.parse(fenced[1].trim());\n    } catch (_err) {}\n  }\n\n  const start = direct.indexOf('{');\n  const end = direct.lastIndexOf('}');\n  if (start !== -1 && end > start) {\n    try {\n      return JSON.parse(direct.slice(start, end + 1));\n    } catch (_err) {\n      return null;\n    }\n  }\n\n  return null;\n};\n\nconst clamp = (value, min, max) => Math.min(max, Math.max(min, value));\nconst allowedEntryTypes = new Set(['short_term', 'long_term', 'persona']);\n\nconst getPending = async () => this.helpers.httpRequest({\n  method: 'GET',\n  url: `${nodeInternalBaseUrl}/api/n8n/memory/pending?threshold=${encodeURIComponent(String(threshold))}`,\n});\n\nconst postNode = async (path, payload) => this.helpers.httpRequest({\n  method: 'POST',\n  url: `${nodeInternalBaseUrl}${path}`,\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify(payload),\n});\n\nconst summarizeOneSession = async (session) => {\n  const messages = Array.isArray(session.messages) ? session.messages : [];\n  const messageLines = messages\n    .map((msg, index) => `${index + 1}. ${msg.role || 'user'}: ${extractMessageText(msg.content)}`)\n    .join('\\n');\n\n  const previousSummary = typeof session.previousSummary === 'string' && session.previousSummary.trim()\n    ? session.previousSummary.trim()\n    : 'None';\n\n  const prompt = [\n    'You are a memory distillation assistant for multi-turn chat sessions.',\n    'Return strictly JSON (no markdown) with this exact shape:',\n    '{\"summary\":\"...\",\"entries\":[{\"type\":\"long_term\",\"languageCode\":\"en\",\"valueJson\":{\"fact\":\"...\"},\"salience\":0.7}]}',\n    '',\n    'Rules:',\n    '- summary must be concise (max 90 words), factual, and useful for future context.',\n    '- entries must contain only durable user facts/preferences/goals worth keeping long-term.',\n    '- Do not include transient turn details as entries.',\n    '- If no good entries exist, return entries as [].',\n    '',\n    `Session ID: ${session.sessionId}`,\n    `Previous summary: ${previousSummary}`,\n    'New messages:',\n    messageLines || '[no messages]',\n  ].join('\\n');\n\n  const completion = await this.helpers.httpRequest({\n    method: 'POST',\n    url: 'https://api.openai.com/v1/chat/completions',\n    headers: {\n      'Content-Type': 'application/json',\n      Authorization: `Bearer ${openAiKey}`,\n    },\n    body: JSON.stringify({\n      model: openAiModel,\n      temperature: 0.2,\n      max_tokens: 700,\n      response_format: { type: 'json_object' },\n      messages: [\n        {\n          role: 'system',\n          content: 'You extract conversation memory and always output strict JSON.',\n        },\n        {\n          role: 'user',\n          content: prompt,\n        },\n      ],\n    }),\n  });\n\n  const raw = completion?.choices?.[0]?.message?.content || '';\n  const parsed = parseJsonLike(raw);\n  if (!parsed || typeof parsed !== 'object') {\n    throw new Error('OpenAI response is not valid JSON object');\n  }\n\n  const summary = toText(parsed.summary).trim();\n  const rawEntries = Array.isArray(parsed.entries) ? parsed.entries : [];\n\n  const entries = rawEntries\n    .slice(0, maxEntriesPerSession)\n    .map((entry) => {\n      const type = allowedEntryTypes.has(entry?.type) ? entry.type : defaultMemoryType;\n      const languageCode = toText(entry?.languageCode || defaultLanguageCode) || defaultLanguageCode;\n      const salienceNum = Number(entry?.salience);\n      const salience = Number.isFinite(salienceNum) ? clamp(salienceNum, 0, 1) : 0.5;\n\n      let valueJson = entry?.valueJson;\n      if (typeof valueJson === 'string' && valueJson.trim()) {\n        valueJson = { fact: valueJson.trim() };\n      }\n      if (!valueJson || typeof valueJson !== 'object') {\n        const fallbackFact = toText(entry?.fact || '');\n        if (!fallbackFact) {\n          return null;\n        }\n        valueJson = { fact: fallbackFact };\n      }\n\n      return {\n        type,\n        languageCode,\n        valueJson,\n        salience,\n      };\n    })\n    .filter(Boolean);\n\n  return { summary, entries };\n};\n\nconst pendingResp = await getPending();\nconst pendingSessions = Array.isArray(pendingResp?.pending)\n  ? pendingResp.pending.slice(0, maxSessions)\n  : [];\n\nconst stats = {\n  fetched: pendingSessions.length,\n  processed: 0,\n  summarized: 0,\n  entriesSaved: 0,\n  dryRun,\n  errors: [],\n};\n\nfor (const session of pendingSessions) {\n  stats.processed += 1;\n  try {\n    const { summary, entries } = await summarizeOneSession(session);\n\n    if (summary && !dryRun) {\n      await postNode('/api/n8n/memory/summary', {\n        sessionId: session.sessionId,\n        summary,\n        lastMessageId: session.lastMessageId,\n      });\n    }\n\n    if (!dryRun && session.userId && entries.length) {\n      for (const entry of entries) {\n        await postNode('/api/n8n/memory/entries', {\n          userId: session.userId,\n          type: entry.type,\n          languageCode: entry.languageCode,\n          valueJson: entry.valueJson,\n          salience: entry.salience,\n        });\n        stats.entriesSaved += 1;\n      }\n    }\n\n    if (summary) {\n      stats.summarized += 1;\n    }\n  } catch (err) {\n    stats.errors.push({\n      sessionId: session.sessionId,\n      message: err?.message ?? 'unknown_error',\n    });\n  }\n}\n\nreturn [{ json: stats }];\n"
+      },
+      "id": "ebcbf99f-f116-4eec-881d-8e613be5b4d3",
+      "name": "Run Memory Sync",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14640,
+        7872
+      ]
+    },
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyX",
+              "unit": "minutes",
+              "value": 15
+            }
+          ]
+        }
+      },
+      "id": "9a9e1f91-b2b6-4b43-bf22-9e3fd4d0a70f",
+      "name": "Cron Memory Sync",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        14368,
+        8064
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Call OpenAI + Fire Callbacks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process": {
+      "main": [
+        [
+          {
+            "node": "Insert to DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook1": {
+      "main": [
+        [
+          {
+            "node": "Process",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook2": {
+      "main": [
+        [
+          {
+            "node": "Moderate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call ElevenLabs": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook4": {
+      "main": [
+        [
+          {
+            "node": "Call ElevenLabs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook3": {
+      "main": [
+        [
+          {
+            "node": "Resolve Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Prompt": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook5": {
+      "main": [
+        [
+          {
+            "node": "Render Filler Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Memory Sync": {
+      "main": [
+        [
+          {
+            "node": "Run Memory Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cron Memory Sync": {
+      "main": [
+        [
+          {
+            "node": "Run Memory Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "fcb11fac-a265-46f4-878b-50796f11cea0",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "784a340060600aed234274c660b30551b7d138537cd17b497a47f55a6e245934"
+  },
+  "id": "HinrjGWTIhzn6oqt",
+  "tags": []
+}

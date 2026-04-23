@@ -1,4 +1,4 @@
-const { fetchRecentMessages, getPersonaById } = require('./memoryRepository');
+const { fetchRecentMessages, fetchMessagesAfterId, getLatestMemorySummary, getPersonaById, getMemoryEntries } = require('./memoryRepository');
 const { getLanguageName } = require('./languageSupport');
 const { debug, warn } = require('./logger');
 const { getWebhookUrl, isN8nConfigured } = require('../../config/n8n');
@@ -11,9 +11,17 @@ const personaPromptCache = new Map();
 
 const isVoiceMode = (mode) => mode === 'voice_call' || mode === 'video_call';
 
-const buildSystemPrompt = (persona, summaries = [], conversationLanguage, mode = 'chat') => {
+const buildSystemPrompt = (persona, summaries = [], memoryEntries = [], conversationLanguage, mode = 'chat') => {
   const summaryBlock = summaries.length
     ? `\nConversation context (from earlier in this session):\n${summaries.map((s) => `- ${s.summary}`).join('\n')}`
+    : '';
+
+  const entriesBlock = memoryEntries.length
+    ? `\nUser details & preferences (permanent memory):\n${memoryEntries.map((e) => {
+        if (typeof e.value === 'string') return `- ${e.value}`;
+        if (e.value && e.value.fact) return `- ${e.value.fact}`;
+        return `- ${JSON.stringify(e.value)}`;
+      }).join('\n')}`
     : '';
 
   // TTS safety: LLM must never produce symbols that break speech synthesis
@@ -36,7 +44,7 @@ const buildSystemPrompt = (persona, summaries = [], conversationLanguage, mode =
 - If the user writes in Turkish, respond entirely in Turkish. If they write in English, respond in English. Follow whatever language they use in each message.
 - Do not default to a fixed language; always mirror the user's current language.`;
 
-  return `${persona.prompt_template}${ttsSafetyBlock}${languageBlock}\n${summaryBlock}`.trim();
+  return `${persona.prompt_template}${ttsSafetyBlock}${languageBlock}\n${entriesBlock}\n${summaryBlock}`.trim();
 };
 
 const buildVoicePromptSuffix = () => `\nVoice call behavior:
@@ -189,27 +197,46 @@ const fetchPersonaPromptTemplateViaN8n = async (personaId, fallbackPromptTemplat
 
 const buildContext = async ({
   sessionId,
+  userId,
   personaId,
-  summaries = [],
+  summaries = [], // still accepted but we will supplement with DB summary
   mode = 'chat',
   conversationLanguage,
+  lockedLanguage = null,
   pendingMessages = []
 }) => {
   const contextLimit = isVoiceMode(mode) ? VOICE_CONTEXT_WINDOW : CHAT_CONTEXT_WINDOW;
 
-  const [persona, messages] = await Promise.all([
+  const [persona, latestSummary, longTermEntries] = await Promise.all([
     getPersonaById(personaId),
-    fetchRecentMessages(sessionId, contextLimit)
+    getLatestMemorySummary(sessionId),
+    userId ? getMemoryEntries(userId, 'long_term', 'en') : Promise.resolve([])
   ]);
 
   if (!persona) {
     throw new Error('Persona not found or inactive');
   }
 
+  const messages = latestSummary && latestSummary.last_message_id
+    ? await fetchMessagesAfterId(sessionId, latestSummary.last_message_id, contextLimit)
+    : await fetchRecentMessages(sessionId, contextLimit);
+
+  const dbSummaries = latestSummary ? [{ summary: latestSummary.summary }] : [];
+  const mergedSummaries = [...dbSummaries, ...summaries];
+
   const promptTemplate = await fetchPersonaPromptTemplateViaN8n(
     persona.id,
     persona.prompt_template
   );
+
+  // Voice/video call: use lockedLanguage as the authoritative signal so
+  // the LLM prompt lines up with what STT is transcribing. If no lock is
+  // set (unexpected during a call, but safe), fall back to the per-turn
+  // conversationLanguage. Chat mode always uses conversationLanguage so
+  // auto-detection can switch mid-session.
+  const effectiveLanguage = isVoiceMode(mode)
+    ? (lockedLanguage || conversationLanguage)
+    : conversationLanguage;
 
   const formattedMessages = messages.map((message) => ({
     role: normalizeRole(message.role),
@@ -223,9 +250,10 @@ const buildContext = async ({
     : [];
 
   return {
-    systemPrompt: `${buildSystemPrompt({ ...persona, prompt_template: promptTemplate }, summaries, conversationLanguage, mode)}${isVoiceMode(mode) ? buildVoicePromptSuffix() : ''}`.trim(),
+    systemPrompt: `${buildSystemPrompt({ ...persona, prompt_template: promptTemplate }, mergedSummaries, longTermEntries, effectiveLanguage, mode)}${isVoiceMode(mode) ? buildVoicePromptSuffix() : ''}`.trim(),
     messages: [...formattedMessages, ...inMemoryMessages],
-    persona
+    persona,
+    effectiveLanguage
   };
 };
 

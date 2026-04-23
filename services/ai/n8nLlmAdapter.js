@@ -1,5 +1,5 @@
 /**
- * n8nLlmAdapter.js
+ * n8nLlmAdapter.js — v2
  *
  * Replaces openaiAdapter.streamChatCompletion() when USE_N8N_LLM=true.
  *
@@ -7,13 +7,23 @@
  *   Node → POST n8n /webhook/ai-chat (with prompt + callbackUrl)
  *   n8n  → OpenAI streaming internally
  *   n8n  → POST Node /api/n8n/llm-sentence  (per sentence)
+ *   n8n  → POST Node /api/n8n/llm-heartbeat (every ~2s while waiting for LLM)
  *   n8n  → POST Node /api/n8n/llm-done      (when complete)
  *
- * Each in-flight LLM turn is tracked in `pendingTurns` by a unique turnId.
- * The sentence callback feeds individual characters into onDelta to maintain
- * full compatibility with SentenceAssembler in chatOrchestrator.
+ * v2 changes:
+ *  - Heartbeat callbacks reset the turn-level timeout so slow-but-alive
+ *    LLM runs aren't killed by the 30s deadline. If we stop receiving
+ *    heartbeats OR sentences for HEARTBEAT_GRACE_MS, we time out.
+ *  - Pooled fetch via keep-alive agent (less TLS handshake cost on
+ *    Hostinger → n8n hop).
+ *  - Single retry on webhook POST failures (connection reset / 5xx)
+ *    with a short backoff. Sentence/done callbacks are idempotent
+ *    against the turnId, so duplicates are harmless.
+ *  - Exports `pingTurn()` so internal routes can feed heartbeat timing.
  */
 
+const http = require('http');
+const https = require('https');
 const { v4: uuidv4 } = require('uuid');
 const {
   getWebhookUrl,
@@ -23,11 +33,25 @@ const {
 } = require('../../config/n8n');
 const { warn, log } = require('./logger');
 
-const LLM_TURN_TIMEOUT_MS = parseInt(process.env.N8N_LLM_TIMEOUT_MS || '30000', 10);
+// Overall turn deadline — hard ceiling even with heartbeats, to prevent
+// runaway turns.
+const LLM_TURN_TIMEOUT_MS = parseInt(process.env.N8N_LLM_TIMEOUT_MS || '45000', 10);
+// If we don't hear from n8n at all (no sentence / heartbeat / done) within
+// this window, we give up.
+const LLM_HEARTBEAT_GRACE_MS = parseInt(process.env.N8N_LLM_HEARTBEAT_GRACE_MS || '8000', 10);
+// Post-failure retry.
+const WEBHOOK_RETRY_DELAY_MS = parseInt(process.env.N8N_WEBHOOK_RETRY_MS || '250', 10);
+
 const INTERNAL_CALLBACK_PATH_PREFIX =
   (process.env.N8N_INTERNAL_CALLBACK_PATH || '/api/n8n').replace(/\/+$/, '');
 
-// Map of turnId → { onSentence, resolve, reject, timeoutHandle }
+// Keep-alive agents — each fetch() without an agent re-opens the TCP/TLS
+// connection. Since we POST to n8n on every voice turn, pool it.
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 32 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 32 });
+const resolveAgent = (url) => (url.startsWith('https:') ? httpsAgent : httpAgent);
+
+// Map of turnId → turn state
 const pendingTurns = new Map();
 const normalizeSentence = (value = '') => String(value || '').replace(/\s+/g, ' ').trim();
 const hasSpeakableChars = (value = '') => /[\p{L}\p{N}]/u.test(value);
@@ -46,7 +70,8 @@ const emitN8nLlmCallAnalytics = ({
   turn,
   status = 'ok',
   tokensIn = 0,
-  tokensOut = 0
+  tokensOut = 0,
+  retries = 0
 }) => {
   if (!turn) {
     return;
@@ -74,25 +99,43 @@ const emitN8nLlmCallAnalytics = ({
     viaN8nLlm: true,
     n8nCallOnly: true,
     n8nCallStatus: status,
+    n8nCallRetries: retries,
     timestamp: new Date().toISOString()
   });
 };
 
-const rejectPendingTurn = (turnId, message, timeoutHandle) => {
-  if (!pendingTurns.has(turnId)) {
-    return;
-  }
+const clearTurnTimers = (turn) => {
+  if (turn?.overallTimeout) clearTimeout(turn.overallTimeout);
+  if (turn?.heartbeatTimeout) clearTimeout(turn.heartbeatTimeout);
+};
+
+const armHeartbeatTimeout = (turn) => {
+  if (!turn) return;
+  if (turn.heartbeatTimeout) clearTimeout(turn.heartbeatTimeout);
+  turn.heartbeatTimeout = setTimeout(() => {
+    if (!pendingTurns.has(turn.turnId)) return;
+    warn('n8n LLM turn timed out (no heartbeat)', { turnId: turn.turnId });
+    rejectPendingTurn(turn.turnId, 'n8n LLM workflow stalled (no heartbeat)');
+  }, LLM_HEARTBEAT_GRACE_MS);
+  if (turn.heartbeatTimeout.unref) turn.heartbeatTimeout.unref();
+};
+
+const pingTurn = (turnId) => {
   const turn = pendingTurns.get(turnId);
-  clearTimeout(timeoutHandle || turn?.timeoutHandle);
+  if (!turn) return;
+  turn.lastHeartbeatAt = Date.now();
+  armHeartbeatTimeout(turn);
+};
+
+const rejectPendingTurn = (turnId, message) => {
+  const turn = pendingTurns.get(turnId);
+  if (!turn) return;
+  clearTurnTimers(turn);
   pendingTurns.delete(turnId);
   emitN8nLlmCallAnalytics({ turn, status: 'error' });
   turn.reject(new Error(message));
 };
 
-/**
- * Called by the internal route when n8n POSTs a sentence callback.
- * Exported so routes/internal.js can wire it up.
- */
 const handleLlmSentenceCallback = (turnId, sentence, index) => {
   const turn = pendingTurns.get(turnId);
   if (!turn || !sentence) return;
@@ -108,23 +151,19 @@ const handleLlmSentenceCallback = (turnId, sentence, index) => {
   if (!turn.firstSentenceMs) {
     turn.firstSentenceMs = Date.now() - turn.startedAt;
   }
+  // Heartbeat-equivalent: a real sentence means the workflow is alive.
+  turn.lastHeartbeatAt = Date.now();
+  armHeartbeatTimeout(turn);
 
-  // Feed characters one-by-one to preserve SentenceAssembler compatibility.
-  // The assembler in chatOrchestrator.js listens for deltas and emits TTS chunks
-  // when it detects sentence boundaries — passing a full sentence at once works too.
   turn.onDelta(normalizedSentence);
-  // Add a space so the assembler sees a natural word boundary between sentences.
   turn.onDelta(' ');
 };
 
-/**
- * Called by the internal route when n8n POSTs the completion callback.
- */
 const handleLlmDoneCallback = (turnId, fullText, tokensIn, tokensOut) => {
   const turn = pendingTurns.get(turnId);
   if (!turn) return;
 
-  clearTimeout(turn.timeoutHandle);
+  clearTurnTimers(turn);
   pendingTurns.delete(turnId);
   emitN8nLlmCallAnalytics({
     turn,
@@ -139,23 +178,47 @@ const handleLlmDoneCallback = (turnId, fullText, tokensIn, tokensOut) => {
   });
 };
 
-/**
- * Called by the internal route when n8n reports an error.
- */
 const handleLlmErrorCallback = (turnId, message) => {
   const turn = pendingTurns.get(turnId);
   if (!turn) return;
 
-  clearTimeout(turn.timeoutHandle);
+  clearTurnTimers(turn);
   pendingTurns.delete(turnId);
   emitN8nLlmCallAnalytics({ turn, status: 'error' });
   turn.reject(new Error(message || 'n8n LLM workflow error'));
 };
 
-/**
- * Drop-in replacement for streamChatCompletion() from openaiAdapter.js.
- * Same signature: { systemPrompt, messages, mode, onDelta } → { fullText, tokensIn, tokensOut }
- */
+// Fetch with keep-alive agent + one retry on transport / 5xx failures.
+const postWithRetry = async (url, body, { retryCount = 1 } = {}) => {
+  let attempt = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    attempt += 1;
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        // Node's built-in fetch (undici) accepts `dispatcher`, but `agent`
+        // is ignored. We leave both in — harmless on undici, useful if
+        // someone swaps in node-fetch.
+        agent: resolveAgent(url)
+      });
+      if (response.ok || response.status < 500 || attempt > retryCount) {
+        return { response, attempts: attempt };
+      }
+      // Retriable 5xx — fall through to retry.
+    } catch (err) {
+      if (attempt > retryCount) {
+        throw err;
+      }
+    }
+    // Short backoff.
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, WEBHOOK_RETRY_DELAY_MS));
+  }
+};
+
 const streamChatCompletionViaN8n = ({
   systemPrompt,
   messages,
@@ -178,61 +241,54 @@ const streamChatCompletionViaN8n = ({
     const callbackBase = nodeBaseValidation.normalized.replace(/\/$/, '');
     const startedAt = Date.now();
 
-    const timeoutHandle = setTimeout(() => {
+    const overallTimeout = setTimeout(() => {
       if (pendingTurns.has(turnId)) {
-        pendingTurns.delete(turnId);
-        warn('n8n LLM turn timed out', { turnId });
-        emitN8nLlmCallAnalytics({
-          turn: {
-            mode,
-            startedAt,
-            requestAckMs: null,
-            firstSentenceMs: null,
-            analyticsContext
-          },
-          status: 'error'
-        });
-        reject(new Error('n8n LLM workflow timed out'));
+        warn('n8n LLM turn hit hard deadline', { turnId });
+        rejectPendingTurn(turnId, 'n8n LLM workflow timed out');
       }
     }, LLM_TURN_TIMEOUT_MS);
+    if (overallTimeout.unref) overallTimeout.unref();
 
-    pendingTurns.set(turnId, {
+    const turn = {
+      turnId,
       onDelta,
       resolve,
       reject,
-      timeoutHandle,
+      overallTimeout,
+      heartbeatTimeout: null,
       mode,
       startedAt,
+      lastHeartbeatAt: startedAt,
       requestAckMs: null,
       firstSentenceMs: null,
       analyticsContext
-    });
+    };
+    pendingTurns.set(turnId, turn);
+    armHeartbeatTimeout(turn);
 
     const webhookUrl = getWebhookUrl('aiChat');
     log('n8n LLM request dispatched', { turnId, mode, webhookUrl });
 
-    fetch(webhookUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        turnId,
-        systemPrompt,
-        messages,
-        mode,
-        openAiKey: process.env.OPENAI_API_KEY || '',
-        openAiModel: process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini',
-        sentenceCallbackUrl: `${callbackBase}${INTERNAL_CALLBACK_PATH_PREFIX}/llm-sentence`,
-        doneCallbackUrl: `${callbackBase}${INTERNAL_CALLBACK_PATH_PREFIX}/llm-done`,
-        errorCallbackUrl: `${callbackBase}${INTERNAL_CALLBACK_PATH_PREFIX}/llm-error`
-      })
-    })
-      .then(async (response) => {
+    const body = JSON.stringify({
+      turnId,
+      systemPrompt,
+      messages,
+      mode,
+      openAiKey: process.env.OPENAI_API_KEY || '',
+      openAiModel: process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini',
+      sentenceCallbackUrl: `${callbackBase}${INTERNAL_CALLBACK_PATH_PREFIX}/llm-sentence`,
+      heartbeatCallbackUrl: `${callbackBase}${INTERNAL_CALLBACK_PATH_PREFIX}/llm-heartbeat`,
+      doneCallbackUrl: `${callbackBase}${INTERNAL_CALLBACK_PATH_PREFIX}/llm-done`,
+      errorCallbackUrl: `${callbackBase}${INTERNAL_CALLBACK_PATH_PREFIX}/llm-error`
+    });
+
+    postWithRetry(webhookUrl, body, { retryCount: 1 })
+      .then(async ({ response, attempts }) => {
         if (response.ok) {
-          const turn = pendingTurns.get(turnId);
-          if (turn) {
-            turn.requestAckMs = Date.now() - startedAt;
+          const live = pendingTurns.get(turnId);
+          if (live) {
+            live.requestAckMs = Date.now() - startedAt;
+            live.retries = attempts - 1;
           }
           return;
         }
@@ -244,24 +300,18 @@ const streamChatCompletionViaN8n = ({
         }
         rejectPendingTurn(
           turnId,
-          `n8n LLM webhook returned ${response.status}${errorText ? `: ${errorText}` : ''}`,
-          timeoutHandle
+          `n8n LLM webhook returned ${response.status}${errorText ? `: ${errorText}` : ''}`
         );
       })
       .catch((err) => {
-        // If the POST itself fails (network error), reject immediately
         rejectPendingTurn(
           turnId,
-          `n8n LLM webhook POST failed: ${err.message}`,
-          timeoutHandle
+          `n8n LLM webhook POST failed: ${err.message}`
         );
       });
   });
 };
 
-/**
- * Returns the count of in-flight LLM turns — useful for health checks.
- */
 const getPendingTurnCount = () => pendingTurns.size;
 
 module.exports = {
@@ -269,5 +319,6 @@ module.exports = {
   handleLlmSentenceCallback,
   handleLlmDoneCallback,
   handleLlmErrorCallback,
+  pingTurn,
   getPendingTurnCount
 };

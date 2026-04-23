@@ -1,3 +1,18 @@
+/**
+ * sttStreamService.js — v2
+ *
+ * Changes vs v1:
+ *  - VAD defaults untangled from STT_MAX_LAG_MS (the old v1 bug where the
+ *    end-of-turn silence threshold was set to 1200 ms — chopping off soft
+ *    speakers mid-sentence).
+ *  - Per-language VAD overrides (tr, ja, ko, zh, hi) applied at startStream.
+ *  - Language hint sourced from callLockedLanguage first, falling back to
+ *    session.language. In chat mode we omit the hint entirely so Whisper
+ *    auto-detects.
+ *  - Keepalive silence ping every 5 s to prevent socket idle timeout when the
+ *    user is quiet but still engaged.
+ */
+
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const {
@@ -9,7 +24,9 @@ const {
   STT_IDLE_TIMEOUT_MS,
   STT_PARTIAL_THROTTLE_MS,
   STT_STREAM_ENABLED,
-  STT_ALLOW_LOCAL_FALLBACK
+  STT_ALLOW_LOCAL_FALLBACK,
+  STT_KEEPALIVE_SILENCE_MS,
+  resolveVadConfig
 } = require('../../config/stt');
 const { log, warn } = require('./logger');
 const { normalizeLanguageCode } = require('./languageSupport');
@@ -28,6 +45,11 @@ const PROTOCOLS = ['realtime'];
 const HEADERS = {
   'OpenAI-Beta': 'realtime=v1'
 };
+
+// 20 ms of 16-bit PCM silence at 16 kHz = 640 bytes of zeros; base64 safely.
+const KEEPALIVE_SILENCE_BYTES = Buffer.alloc(
+  Math.round((STT_SAMPLE_RATE * 2 * 20) / 1000)
+);
 
 const streams = new Map();
 
@@ -58,11 +80,11 @@ const sendSttError = (controller, message, extra = {}) => {
   });
 };
 
-const estimateDurationMs = (byteLength, sampleRate = STT_SAMPLE_RATE, encoding = DEFAULT_ENCODING) => {
+const estimateDurationMs = (byteLength, sampleRate = STT_SAMPLE_RATE) => {
   if (!byteLength) {
     return 0;
   }
-  const bytesPerSample = encoding === 'pcm16' ? 2 : 2;
+  const bytesPerSample = 2; // pcm16
   const samples = byteLength / bytesPerSample;
   return Math.round((samples / sampleRate) * 1000);
 };
@@ -132,13 +154,15 @@ const resolveSessionUpdateEventType = () => {
 };
 
 const configureTranscriptionSession = (controller) => {
-  const { socket, encoding, languageHint } = controller;
+  const { socket, encoding, languageHint, vadConfig } = controller;
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     return;
   }
   const transcriptionConfig = {
     model: STT_TRANSCRIBE_MODEL
   };
+  // Only hard-lock language when the session is in a call. Chat mode uses
+  // auto-detect so the user can switch languages freely.
   if (languageHint) {
     transcriptionConfig.language = languageHint;
   }
@@ -149,13 +173,18 @@ const configureTranscriptionSession = (controller) => {
       input_audio_transcription: transcriptionConfig,
       turn_detection: {
         type: 'server_vad',
-        silence_duration_ms: STT_MAX_LAG_MS,
-        prefix_padding_ms: 200,
-        threshold: 0.55
+        silence_duration_ms: vadConfig.silenceDurationMs,
+        prefix_padding_ms: vadConfig.prefixPaddingMs,
+        threshold: vadConfig.threshold
       }
     }
   };
   socket.send(JSON.stringify(payload));
+  log('STT session configured', {
+    sessionId: controller.sessionId,
+    languageHint: languageHint || null,
+    vadConfig
+  });
 };
 
 const getOrCreateTranscriptState = (controller, itemId) => {
@@ -164,7 +193,8 @@ const getOrCreateTranscriptState = (controller, itemId) => {
       id: uuidv4(),
       text: '',
       startedAt: Date.now(),
-      lastPartialAt: 0
+      lastPartialAt: 0,
+      audioMsReceived: 0
     });
   }
   return controller.transcripts.get(itemId);
@@ -194,6 +224,7 @@ const handleTranscriptionComplete = async (controller, event) => {
   const metadata = {
     source: 'openai_stt',
     latencyMs,
+    audioDurationMs: transcript.audioMsReceived,
     openaiStt: {
       itemId: event.item_id,
       realtimeModel: STT_REALTIME_MODEL,
@@ -306,6 +337,7 @@ const connectSocket = (controller) =>
           userId: controller.userId
         });
         configureTranscriptionSession(controller);
+        startKeepalive(controller);
         resolve();
       };
       const handleError = (err) => {
@@ -320,10 +352,37 @@ const connectSocket = (controller) =>
     }
   });
 
+const startKeepalive = (controller) => {
+  if (controller.keepaliveTimer) {
+    clearInterval(controller.keepaliveTimer);
+  }
+  controller.keepaliveTimer = setInterval(() => {
+    if (!controller.socket || controller.socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const now = Date.now();
+    // Only send keepalive silence if the user hasn't sent audio recently.
+    if (now - controller.lastAudioAt < STT_KEEPALIVE_SILENCE_MS) {
+      return;
+    }
+    controller.socket.send(
+      JSON.stringify({
+        type: 'input_audio_buffer.append',
+        audio: KEEPALIVE_SILENCE_BYTES.toString('base64')
+      })
+    );
+  }, STT_KEEPALIVE_SILENCE_MS);
+  controller.keepaliveTimer.unref?.();
+};
+
 const destroyController = async (controller, reason = 'shutdown') => {
   controller.destroyed = true;
   if (controller.idleTimer) {
     clearTimeout(controller.idleTimer);
+  }
+  if (controller.keepaliveTimer) {
+    clearInterval(controller.keepaliveTimer);
+    controller.keepaliveTimer = null;
   }
   if (controller.socket && controller.socket.readyState === WebSocket.OPEN) {
     try {
@@ -360,11 +419,7 @@ const appendChunk = (controller, payload) => {
     sendSttError(controller, 'Audio chunk missing or invalid.');
     return false;
   }
-  const durationMs = estimateDurationMs(normalized.byteLength, controller.sampleRate, controller.encoding);
-  // if (!hasSessionSttBudget(controller.sessionId, durationMs)) {
-  //   sendSttError(controller, 'Streaming STT quota exceeded for this session.', summarizeQuota(controller.sessionId));
-  //   return false;
-  // }
+  const durationMs = estimateDurationMs(normalized.byteLength, controller.sampleRate);
 
   const now = Date.now();
   const wallClockElapsed = now - controller.startedAt;
@@ -380,6 +435,14 @@ const appendChunk = (controller, payload) => {
   incrementSessionSttUsage(controller.sessionId, durationMs);
   controller.bufferedMs = projectedBufferedMs;
   controller.pendingCommitMs += durationMs;
+  controller.lastAudioAt = now;
+
+  // Tag the active transcript with received audio so the orchestrator can
+  // apply the "short clip hallucination" filter (see languageResolution).
+  controller.transcripts.forEach((transcript) => {
+    transcript.audioMsReceived = (transcript.audioMsReceived || 0) + durationMs;
+  });
+
   controller.socket.send(
     JSON.stringify({
       type: 'input_audio_buffer.append',
@@ -398,16 +461,9 @@ const commitBuffer = (controller) => {
   if (!controller.socket || controller.socket.readyState !== WebSocket.OPEN) {
     return;
   }
-  // Guard: OpenAI requires at least MIN_COMMIT_AUDIO_MS (100 ms) of buffered audio
-  // before accepting a commit.  Sending a commit with an empty or nearly-empty
-  // buffer produces the "buffer too small" error seen in the Flutter logs when
-  // STT is stopped multiple times in rapid succession (e.g. on TTS playback start).
   if (controller.pendingCommitMs < MIN_COMMIT_AUDIO_MS) {
     return;
   }
-  // Atomically reset BEFORE the async send so that concurrent stopStream calls
-  // triggered by the Flutter client cannot race through the check above and send
-  // a second commit after the buffer is already drained.
   const msToCommit = controller.pendingCommitMs;
   controller.pendingCommitMs = 0;
   controller.socket.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
@@ -418,8 +474,8 @@ const commitBuffer = (controller) => {
 };
 
 const startStream = async ({ session, user, sendEvent, onTranscript }, options = {}) => {
-  const mode = session?.mode;
-  if (mode === 'chat') {
+  const mode = session?.active_mode || session?.mode;
+  if (mode === 'chat' && !options.allowChat) {
     sendEvent('error', { message: 'Streaming STT is not available in chat sessions.' });
     return;
   }
@@ -447,6 +503,17 @@ const startStream = async ({ session, user, sendEvent, onTranscript }, options =
     await destroyController(existing, 'restart');
   }
 
+  // Language hint: hard-lock for call modes via call_locked_language,
+  // otherwise omit (Whisper auto-detects).
+  const callLocked = session?.call_locked_language
+    ? normalizeLanguageCode(session.call_locked_language)
+    : null;
+  const optionLang = options.language
+    ? normalizeLanguageCode(options.language)
+    : null;
+  const languageHint = callLocked || optionLang || null;
+  const vadConfig = resolveVadConfig(languageHint);
+
   const controller = {
     sessionId: session.id,
     userId: user.id,
@@ -460,8 +527,11 @@ const startStream = async ({ session, user, sendEvent, onTranscript }, options =
     reconnectAttempts: 0,
     destroyed: false,
     idleTimer: null,
+    keepaliveTimer: null,
+    lastAudioAt: Date.now(),
     startedAt: Date.now(),
-    languageHint: normalizeLanguageCode(session.language || options.language),
+    languageHint,
+    vadConfig,
     socket: null
   };
 
@@ -472,7 +542,9 @@ const startStream = async ({ session, user, sendEvent, onTranscript }, options =
     sendEvent('stt_stream_ready', {
       sampleRate,
       encoding,
-      transcriptId: options.transcriptId
+      transcriptId: options.transcriptId,
+      languageHint,
+      vadConfig
     });
   } catch (err) {
     streams.delete(session.id);
@@ -508,6 +580,22 @@ const stopStream = async ({ session, sendEvent }, payload = {}) => {
   }
 };
 
+/**
+ * Re-apply VAD + language settings mid-stream. Called when the session's
+ * call_locked_language changes (e.g. pre-call language picker updates).
+ */
+const reconfigureStream = (sessionId, { language } = {}) => {
+  const controller = streams.get(sessionId);
+  if (!controller) {
+    return false;
+  }
+  const normalizedLang = language ? normalizeLanguageCode(language) : null;
+  controller.languageHint = normalizedLang;
+  controller.vadConfig = resolveVadConfig(normalizedLang);
+  configureTranscriptionSession(controller);
+  return true;
+};
+
 const terminateStream = async (sessionId) => {
   const controller = streams.get(sessionId);
   if (!controller) {
@@ -520,5 +608,6 @@ module.exports = {
   startStream,
   pushAudioChunk,
   stopStream,
+  reconfigureStream,
   terminateStream
 };
