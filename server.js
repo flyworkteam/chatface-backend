@@ -25,6 +25,13 @@ const {
 } = require('./controllers/aiSessionController');
 const { initializeRealtimeGateway } = require('./websocket/realtimeGateway');
 const http = require('http');
+const {
+  createVoiceGateway,
+  createVideoGateway,
+  createVisemeRouter,
+  isVoiceStreamingEnabled,
+  isVideoCallEnabled
+} = require('./services/voice');
 
 
 const { startScheduler, stopScheduler } = require('./services/notificationScheduler');
@@ -85,6 +92,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/webhooks', webhookRoutes);
 app.get('/api/ai/tts/cache/:cacheKey', getTtsCacheAudio);
 app.get('/api/ai/tts/live/:streamId', getLiveTtsAudio);
+app.use('/api/ai', createVisemeRouter());
 app.use('/api/ai', aiSessionRoutes);
 
 
@@ -116,8 +124,18 @@ const startServer = async () => {
     startScheduler();
     startPremiumExpirationScheduler();
 
-    // Start server
+    // /realtime gateway (chat akışı + legacy STT)
     initializeRealtimeGateway(server);
+
+    // Voice + video gateway boot (Arşiv migration Phase 8) — feature flag arkasında.
+    if (isVoiceStreamingEnabled()) {
+      createVoiceGateway(server);
+      console.log('🎙️  Voice streaming gateway active at /ws/voice');
+    }
+    if (isVideoCallEnabled()) {
+      createVideoGateway(server);
+      console.log('📹 Video call gateway active at /ws/video');
+    }
 
     server.listen(PORT, () => {
       console.log('');

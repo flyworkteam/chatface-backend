@@ -39,7 +39,8 @@ const initializeRealtimeGateway = (server) => {
     const query = Object.fromEntries(parsedUrl.searchParams.entries());
 
     if (pathname !== '/realtime') {
-      socket.destroy();
+      // Diğer gateway'ler (voice/video) kendi listener'larında işleyecek;
+      // socket'i destroy etmiyoruz — Arşiv migration planı Phase 8.
       return;
     }
 
@@ -211,8 +212,6 @@ const routeIncomingEvent = async (ws, payload) => {
       await handleLanguageUpdate(ws, payload, sendEvent);
       break;
     case 'ping':
-      // Some legacy clients still emit JSON-level "ping" events instead of "pong".
-      // Treat them as a heartbeat to avoid spurious errors/noise and reply explicitly.
       debug('Realtime JSON ping received', {
         sessionId: ws.context.session.id,
         userId: ws.context.user.id,
@@ -242,10 +241,7 @@ const handleLanguageUpdate = async (ws, payload, sendEvent) => {
   }
 
   try {
-    // Persist to DB
     await updateSessionLanguage(session.id, languageCode);
-
-    // Update in-memory session
     ws.context.session = { ...session, language: languageCode };
 
     log('Session language updated', {
@@ -255,8 +251,6 @@ const handleLanguageUpdate = async (ws, payload, sendEvent) => {
       to: languageCode
     });
 
-    // Terminate old server-side STT stream; the client will
-    // restart its own STT and re-initiate the stream.
     try {
       await sttStreamService.terminateStream(session.id);
     } catch (sttErr) {

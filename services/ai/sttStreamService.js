@@ -356,13 +356,20 @@ const startKeepalive = (controller) => {
   if (controller.keepaliveTimer) {
     clearInterval(controller.keepaliveTimer);
   }
+
+  // Guard against timer jitter: trigger keepalive well before idle timeout.
+  const keepaliveCheckMs = Math.min(1000, STT_KEEPALIVE_SILENCE_MS);
+  const keepaliveTriggerMs = Math.min(
+    STT_KEEPALIVE_SILENCE_MS,
+    Math.max(1000, STT_IDLE_TIMEOUT_MS - 2000)
+  );
+
   controller.keepaliveTimer = setInterval(() => {
     if (!controller.socket || controller.socket.readyState !== WebSocket.OPEN) {
       return;
     }
     const now = Date.now();
-    // Only send keepalive silence if the user hasn't sent audio recently.
-    if (now - controller.lastAudioAt < STT_KEEPALIVE_SILENCE_MS) {
+    if (now - controller.lastAudioAt < keepaliveTriggerMs) {
       return;
     }
     controller.socket.send(
@@ -371,7 +378,10 @@ const startKeepalive = (controller) => {
         audio: KEEPALIVE_SILENCE_BYTES.toString('base64')
       })
     );
-  }, STT_KEEPALIVE_SILENCE_MS);
+    controller.lastAudioAt = now;
+    // Keep STT stream alive during quiet windows (e.g. while TTS is playing).
+    resetIdleTimer(controller);
+  }, keepaliveCheckMs);
   controller.keepaliveTimer.unref?.();
 };
 

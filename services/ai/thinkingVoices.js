@@ -1,5 +1,6 @@
 const { enqueueSentence } = require('./ttsPipeline');
 const { debug, warn } = require('./logger');
+const { normalizeLanguageCode } = require('./languageSupport');
 
 // Varsayılan: 450ms → 350ms. AI yanıtı işlenmeden önce kullanıcıya hızlıca geri bildirim
 // verilmesi için süre kısaltıldı. Karakter "Bir saniye." gibi bir dolgu cümlesi çalar,
@@ -14,7 +15,7 @@ const THINKING_PHRASES = {
   de: ['Einen Moment.', 'Lass mich überlegen.', 'Gute Frage.'],
   pt: ['Um segundo.', 'Deixa eu pensar.', 'Boa pergunta.'],
   it: ['Un secondo.', 'Fammi pensare.', 'Bella domanda.'],
-  ar: ['لحظة واحدة.', 'دعني أفكر.', 'سؤال جيد.'],
+  hi: ['एक सेकंड।', 'ज़रा सोचने दो।', 'अच्छा सवाल है।'],
   ja: ['少し待ってください。', '少し考えます。', 'いい質問ですね。'],
   ko: ['잠시만요.', '생각해 볼게요.', '좋은 질문이네요.'],
   zh: ['稍等一下。', '让我想想。', '这是个好问题。'],
@@ -157,6 +158,118 @@ const getRandomRejectionPhrase = (phrases, language) => {
   return list[Math.floor(Math.random() * list.length)];
 };
 
+// Gateway errorlarında (moderation / reconnect exhausted) kullanıcıya yazılacak
+// kısa ve konuşma diliyle uyumlu fallback cümleler.
+const GATEWAY_HINT_PHRASES = {
+  moderation: {
+    en: [
+      "I can't respond to that request right now. Try asking in a different way."
+    ],
+    tr: [
+      'Bu isteğe şu an yanıt veremiyorum. İstersen farklı bir şekilde sor.'
+    ],
+    de: [
+      'Darauf kann ich gerade nicht antworten. Frag gern anders.'
+    ],
+    it: [
+      'A questa richiesta non posso rispondere adesso. Prova a chiederlo in un altro modo.'
+    ],
+    fr: [
+      "Je ne peux pas répondre à cette demande pour le moment. Essaie de reformuler."
+    ],
+    ja: [
+      '今はそのリクエストには答えられません。別の言い方で聞いてみてください。'
+    ],
+    es: [
+      'Ahora no puedo responder a esa solicitud. Intenta preguntarlo de otra forma.'
+    ],
+    ru: [
+      'Сейчас я не могу ответить на такой запрос. Спроси, пожалуйста, по-другому.'
+    ],
+    ko: [
+      '지금은 그 요청에 답할 수 없어요. 다른 방식으로 물어봐 주세요.'
+    ],
+    hi: [
+      'मैं अभी उस अनुरोध का जवाब नहीं दे सकता। कृपया इसे दूसरे तरीके से पूछें।'
+    ],
+    pt: [
+      'Não posso responder a esse pedido agora. Tente perguntar de outra forma.'
+    ],
+    zh: [
+      '我现在无法回应这个请求。请换一种说法再问一次。'
+    ]
+  },
+  connection_retry_exhausted: {
+    en: [
+      "There was a connection problem and I couldn't reconnect. Could you end and restart the call?"
+    ],
+    tr: [
+      'Bağlantıda bir sorun oluştu ve yeniden bağlanamadım. Konuşmayı kapatıp tekrar açar mısın?'
+    ],
+    de: [
+      'Es gab ein Verbindungsproblem und ich konnte mich nicht wieder verbinden. Kannst du den Anruf beenden und neu starten?'
+    ],
+    it: [
+      'C’è stato un problema di connessione e non sono riuscito a ricollegarmi. Puoi chiudere e riaprire la chiamata?'
+    ],
+    fr: [
+      "Il y a eu un problème de connexion et je n'ai pas pu me reconnecter. Peux-tu fermer puis relancer l'appel ?"
+    ],
+    ja: [
+      '接続に問題があり、再接続できませんでした。通話を一度終了して、もう一度開始してもらえますか？'
+    ],
+    es: [
+      'Hubo un problema de conexión y no pude reconectarme. ¿Puedes cerrar y volver a iniciar la llamada?'
+    ],
+    ru: [
+      'Возникла проблема с соединением, и мне не удалось переподключиться. Можешь завершить звонок и запустить его снова?'
+    ],
+    ko: [
+      '연결 문제가 발생해서 다시 연결하지 못했어요. 통화를 종료하고 다시 시작해 주시겠어요?'
+    ],
+    hi: [
+      'कनेक्शन में समस्या आई और मैं दोबारा कनेक्ट नहीं हो पाया। क्या आप कॉल बंद करके फिर से शुरू कर सकते हैं?'
+    ],
+    pt: [
+      'Houve um problema de conexão e não consegui reconectar. Você pode encerrar e iniciar a chamada novamente?'
+    ],
+    zh: [
+      '连接出现了问题，我未能重新连接。你可以先结束通话再重新开始吗？'
+    ]
+  }
+};
+
+const resolveGatewayHintKey = (code) => {
+  if (code === 'moderation') {
+    return 'moderation';
+  }
+  if (
+    code === 'connection_retry_exhausted' ||
+    code === 'llm_error' ||
+    code === 'ai_pipeline_error' ||
+    code === 'network_error'
+  ) {
+    return 'connection_retry_exhausted';
+  }
+  return null;
+};
+
+const getGatewayErrorHint = ({ code, language }) => {
+  const normalizedCode = String(code || '').trim().toLowerCase();
+  const key = resolveGatewayHintKey(normalizedCode);
+  if (!key) {
+    return null;
+  }
+  const normalizedLanguage = normalizeLanguageCode(language, 'en') || 'en';
+  const variants = GATEWAY_HINT_PHRASES[key][normalizedLanguage]
+    || GATEWAY_HINT_PHRASES[key].en;
+  if (!Array.isArray(variants) || variants.length === 0) {
+    return null;
+  }
+  const index = Math.floor(Math.random() * variants.length);
+  return variants[index];
+};
+
 /**
  * STT transkripti reddedildiğinde sesli geri bildirim çal.
  * - 'wrong_language': Kullanıcı oturum diline uymayan bir dilde konuştu
@@ -201,7 +314,9 @@ module.exports = {
   cancelThinkingVoice,
   getRandomPhrase,
   playRejectionVoice,
+  getGatewayErrorHint,
   THINKING_PHRASES,
   CANNOT_UNDERSTAND_PHRASES,
-  WRONG_LANGUAGE_PHRASES
+  WRONG_LANGUAGE_PHRASES,
+  GATEWAY_HINT_PHRASES
 };

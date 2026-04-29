@@ -382,6 +382,16 @@ const handleUserMessage = async (
               turnSec: elapsedSec(turnStartedAt),
               reason: result.reason
             });
+          } else if (result.softWarn) {
+            log('Moderation soft-warn (allow)', {
+              sessionId: session.id,
+              userId: user.id,
+              turnSec: elapsedSec(turnStartedAt),
+              reason: result.reason,
+              flaggedCategories: result.flaggedCategories || [],
+              categoryScores: result.categoryScores || {},
+              hardBlockThreshold: result.hardBlockThreshold
+            });
           }
           return result;
         })
@@ -620,6 +630,9 @@ const handleUserMessage = async (
     sendEvent('assistant_done', {
       latencyMs,
       messageId: null,
+      // Voice gateway aiPipelineBridge bu field'ı okuyup ttsBridge'e veriyor.
+      // /realtime client'ları (chat) field'ı zararsızca ignore eder.
+      fullText: llmResult.fullText,
       timings: {
         prepMs: turnTimings.prepDoneMs ?? null,
         llmStartMs: turnTimings.llmStartMs ?? null,

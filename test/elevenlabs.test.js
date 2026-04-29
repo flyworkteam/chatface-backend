@@ -41,7 +41,7 @@ test('ElevenLabs payload uses language_code and pronunciation locators in preced
   else process.env.ELEVENLABS_PRONUNCIATION_DICTIONARIES = originalConfig;
 });
 
-test('ElevenLabs call payload uses hardcoded Flash without changing chat default', () => {
+test('ElevenLabs call/chat payloads use Flash model while preserving mode-specific latency', () => {
   const originalCallModel = process.env.ELEVENLABS_CALL_MODEL;
   const originalModel = process.env.ELEVENLABS_MODEL;
   const originalCallLatency = process.env.ELEVENLABS_CALL_STREAMING_LATENCY;
@@ -79,7 +79,7 @@ test('ElevenLabs call payload uses hardcoded Flash without changing chat default
   assert.equal(callPayload.model_id, 'eleven_flash_v2_5');
   assert.equal(callPayload.optimize_streaming_latency, 1);
   assert.equal(callPayload.apply_text_normalization, 'on');
-  assert.equal(chatPayload.model_id, 'eleven_multilingual_v2');
+  assert.equal(chatPayload.model_id, 'eleven_flash_v2_5');
   assert.equal(chatPayload.optimize_streaming_latency, 0);
   assert.equal(chatPayload.apply_text_normalization, undefined);
   assert.notDeepEqual(callContext, chatContext);

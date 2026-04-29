@@ -1,7 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { summarizeModerationResult } = require('../services/ai/moderationService');
+const {
+  summarizeModerationResult,
+  shouldHardBlockFromSummary
+} = require('../services/ai/moderationService');
 const {
   buildModerationErrorPayload,
   buildModerationLogPayload
@@ -68,4 +71,43 @@ test('moderation blocked payloads keep generic client copy with structured diagn
     message: 'Message blocked',
     reason: 'harassment'
   });
+});
+
+test('soft moderation category below threshold does not hard-block', () => {
+  const hardBlock = shouldHardBlockFromSummary({
+    summary: {
+      flaggedCategories: ['violence'],
+      categoryScores: { violence: 0.35 }
+    },
+    threshold: 0.7,
+    softCategories: new Set(['violence', 'violence/graphic'])
+  });
+
+  assert.equal(hardBlock, false);
+});
+
+test('soft moderation category above threshold hard-blocks', () => {
+  const hardBlock = shouldHardBlockFromSummary({
+    summary: {
+      flaggedCategories: ['violence'],
+      categoryScores: { violence: 0.82 }
+    },
+    threshold: 0.7,
+    softCategories: new Set(['violence', 'violence/graphic'])
+  });
+
+  assert.equal(hardBlock, true);
+});
+
+test('non-soft moderation category always hard-blocks', () => {
+  const hardBlock = shouldHardBlockFromSummary({
+    summary: {
+      flaggedCategories: ['harassment'],
+      categoryScores: { harassment: 0.15 }
+    },
+    threshold: 0.7,
+    softCategories: new Set(['violence', 'violence/graphic'])
+  });
+
+  assert.equal(hardBlock, true);
 });

@@ -809,6 +809,21 @@ const endCall = async (req, res, next) => {
   }
 };
 
+// Frontend WebRTC PeerConnection için ICE config döndürür.
+// Şimdilik STUN-only; TURN credential rotation Phase 13 takip işi.
+const buildIceServersForResponse = () => {
+  const raw = process.env.WEBRTC_ICE_SERVERS || '';
+  if (raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    } catch (_) {
+      // bozuk JSON ise default'a düş
+    }
+  }
+  return [{ urls: 'stun:stun.l.google.com:19302' }];
+};
+
 const getSessionCallState = async (req, res, next) => {
   try {
     const userId = req.user.id;
@@ -823,13 +838,21 @@ const getSessionCallState = async (req, res, next) => {
     }
 
     const state = await getCallState(sessionId);
+    const webrtcEnabled =
+      String(process.env.WEBRTC_ENABLED || 'false').toLowerCase() === 'true';
     res.json({
       success: true,
-      data: state || {
-        activeMode: 'chat',
-        lockedLanguage: null,
-        activeCallStartedAt: null,
-        isCallActive: false
+      data: {
+        ...(state || {
+          activeMode: 'chat',
+          lockedLanguage: null,
+          activeCallStartedAt: null,
+          isCallActive: false
+        }),
+        webrtc: {
+          enabled: webrtcEnabled,
+          iceServers: webrtcEnabled ? buildIceServersForResponse() : []
+        }
       }
     });
   } catch (error) {

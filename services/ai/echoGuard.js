@@ -26,7 +26,7 @@ const MIN_BIGRAM_SIMILARITY = 0.7;
 
 // Loose thresholds (applied within RECENT_ECHO_GRACE_MS). The mic is still hot
 // and partials dribble in — catch aggressively.
-const RECENT_ECHO_GRACE_MS = 15000;
+const RECENT_ECHO_GRACE_MS = 8000;
 const RECENT_MIN_TOKEN_OVERLAP = 0.45;
 const RECENT_MIN_BIGRAM_SIMILARITY = 0.55;
 
@@ -37,11 +37,11 @@ const WINDOW_MIN_TOKEN_OVERLAP = 0.85;
 
 // When TTS is actively playing, very short transcripts are almost always echo
 // (single word affirmations, breath sounds, the tail of the assistant's voice).
-const SHORT_TRANSCRIPT_DURING_SPEECH_MAX_CHARS = 25;
+const SHORT_TRANSCRIPT_DURING_SPEECH_MAX_CHARS = 10;
 
-const MIN_SPEECH_WINDOW_MS = 1800;
-const MAX_SPEECH_WINDOW_MS = 15000;
-const SPEECH_WINDOW_BUFFER_MS = 900;
+const MIN_SPEECH_WINDOW_MS = 900;
+const MAX_SPEECH_WINDOW_MS = 8000;
+const SPEECH_WINDOW_BUFFER_MS = 500;
 
 const recentSpeechBySession = new Map();
 const activeSpeechWindowsBySession = new Map();
@@ -143,7 +143,7 @@ const estimateSpeechWindowMs = (text = '') => {
     return MIN_SPEECH_WINDOW_MS;
   }
   const wordCount = normalized.split(' ').filter(Boolean).length;
-  const estimatedMs = (wordCount * 360) + SPEECH_WINDOW_BUFFER_MS;
+  const estimatedMs = (wordCount * 220) + SPEECH_WINDOW_BUFFER_MS;
   return Math.max(MIN_SPEECH_WINDOW_MS, Math.min(MAX_SPEECH_WINDOW_MS, estimatedMs));
 };
 
@@ -248,8 +248,14 @@ const findEchoMatch = ({ sessionId, transcript }) => {
     const overlapThreshold = isRecent ? RECENT_MIN_TOKEN_OVERLAP : MIN_TOKEN_OVERLAP;
     const bigramThreshold = isRecent ? RECENT_MIN_BIGRAM_SIMILARITY : MIN_BIGRAM_SIMILARITY;
 
+    const nearFullLength =
+      Math.min(normalizedTranscript.length, candidate.normalized.length) /
+        Math.max(normalizedTranscript.length, candidate.normalized.length) >=
+      0.8;
+    const containmentPasses = containsMatch && (assistantActive || isRecent || nearFullLength);
+
     const passesByFull =
-      containsMatch ||
+      containmentPasses ||
       (tokenOverlap >= overlapThreshold && bigramSimilarity >= bigramThreshold);
     const passesByWindow = windowOverlap >= WINDOW_MIN_TOKEN_OVERLAP;
 
