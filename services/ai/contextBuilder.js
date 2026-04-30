@@ -1,4 +1,4 @@
-const { fetchRecentMessages, fetchMessagesAfterId, getLatestMemorySummary, getPersonaById, getMemoryEntries } = require('./memoryRepository');
+const { fetchRecentMessages, fetchMessagesAfterId, getLatestMemorySummary, getPersonaById, getMemoryEntries, getUserById } = require('./memoryRepository');
 const { getLanguageName } = require('./languageSupport');
 const { debug, warn } = require('./logger');
 const { getWebhookUrl, isN8nConfigured } = require('../../config/n8n');
@@ -11,17 +11,27 @@ const personaPromptCache = new Map();
 
 const isVoiceMode = (mode) => mode === 'voice_call' || mode === 'video_call';
 
-const buildSystemPrompt = (persona, summaries = [], memoryEntries = [], conversationLanguage, mode = 'chat') => {
+const buildSystemPrompt = (persona, summaries = [], memoryEntries = [], conversationLanguage, mode = 'chat', user = null) => {
   const summaryBlock = summaries.length
     ? `\nConversation context (from earlier in this session):\n${summaries.map((s) => `- ${s.summary}`).join('\n')}`
     : '';
 
   const entriesBlock = memoryEntries.length
     ? `\nUser details & preferences (permanent memory):\n${memoryEntries.map((e) => {
-        if (typeof e.value === 'string') return `- ${e.value}`;
-        if (e.value && e.value.fact) return `- ${e.value.fact}`;
-        return `- ${JSON.stringify(e.value)}`;
-      }).join('\n')}`
+      if (typeof e.value === 'string') return `- ${e.value}`;
+      if (e.value && e.value.fact) return `- ${e.value.fact}`;
+      return `- ${JSON.stringify(e.value)}`;
+    }).join('\n')}`
+    : '';
+
+  const userContextBlock = user
+    ? `\nUser information:
+- Name: ${user.fullName || 'Not provided'}
+- Age: ${user.age || 'Not provided'}
+- Gender: ${user.gender || 'Not provided'}
+- Location: ${user.country || 'Not provided'}
+- About: ${user.aboutMe || 'No bio provided'}
+(Use this information to personalize your responses, but do not mention that you know it came from the user's profile.)`
     : '';
 
   // TTS safety: LLM must never produce symbols that break speech synthesis
@@ -44,15 +54,22 @@ const buildSystemPrompt = (persona, summaries = [], memoryEntries = [], conversa
 - If the user writes in Turkish, respond entirely in Turkish. If they write in English, respond in English. Follow whatever language they use in each message.
 - Do not default to a fixed language; always mirror the user's current language.`;
 
-  return `${persona.prompt_template}${ttsSafetyBlock}${languageBlock}\n${entriesBlock}\n${summaryBlock}`.trim();
+  return `${persona.prompt_template}${userContextBlock}${ttsSafetyBlock}${languageBlock}\n${entriesBlock}\n${summaryBlock}`.trim();
 };
 
-const buildVoicePromptSuffix = () => `\nVoice call behavior:
+const buildVoicePromptSuffix = (mode) => {
+  const modeLabel = mode === 'video_call' ? 'video chat' : 'voice chat';
+
+  return `\nCurrent interaction mode: ${modeLabel}
+- You are speaking with the user in a ${modeLabel}, not reading a text chat.
+- Never say or imply that you can read the user's writing, messages, or text input in this mode.
+- If you refer to the user's input, describe it as something you heard or understood.
 - Keep each reply short and conversational — typically one to three sentences.
 - Lead with your most important thought in the very first sentence so it can be spoken immediately.
 - Avoid listing things; weave information naturally into speech.
 - Match the user's energy and pace: if they're brief, be brief; if they elaborate, you can too.
 - Never start with filler phrases like "Certainly!" or "Of course!" — just respond naturally.`;
+};
 
 const ATTACHMENT_INLINE_LIMIT = 350 * 1024; // 350KB safeguard
 
@@ -207,10 +224,11 @@ const buildContext = async ({
 }) => {
   const contextLimit = isVoiceMode(mode) ? VOICE_CONTEXT_WINDOW : CHAT_CONTEXT_WINDOW;
 
-  const [persona, latestSummary, longTermEntries] = await Promise.all([
+  const [persona, latestSummary, longTermEntries, user] = await Promise.all([
     getPersonaById(personaId),
     getLatestMemorySummary(sessionId),
-    userId ? getMemoryEntries(userId, 'long_term', 'en') : Promise.resolve([])
+    userId ? getMemoryEntries(userId, 'long_term', 'en') : Promise.resolve([]),
+    userId ? getUserById(userId) : Promise.resolve(null)
   ]);
 
   if (!persona) {
@@ -244,15 +262,16 @@ const buildContext = async ({
   }));
   const inMemoryMessages = Array.isArray(pendingMessages)
     ? pendingMessages.map((message) => ({
-        role: normalizeRole(message.role),
-        content: toContentItems(message.content)
-      }))
+      role: normalizeRole(message.role),
+      content: toContentItems(message.content)
+    }))
     : [];
 
   return {
-    systemPrompt: `${buildSystemPrompt({ ...persona, prompt_template: promptTemplate }, mergedSummaries, longTermEntries, effectiveLanguage, mode)}${isVoiceMode(mode) ? buildVoicePromptSuffix() : ''}`.trim(),
+    systemPrompt: `${buildSystemPrompt({ ...persona, prompt_template: promptTemplate }, mergedSummaries, longTermEntries, effectiveLanguage, mode, user)}${isVoiceMode(mode) ? buildVoicePromptSuffix(mode) : ''}`.trim(),
     messages: [...formattedMessages, ...inMemoryMessages],
     persona,
+    user,
     effectiveLanguage
   };
 };

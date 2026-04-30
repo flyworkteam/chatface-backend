@@ -168,7 +168,7 @@ const getPersonaById = async (personaId) => {
   }
 
   const [rows] = await pool.execute(
-    `SELECT id, name, description, prompt_template, default_language
+    `SELECT id, name, description, prompt_template, short_description
      FROM persona_profiles
      WHERE id = ? AND active = 1`,
     [personaId]
@@ -225,6 +225,36 @@ const getMessageById = async (messageId) => {
   };
 };
 
+const getUserById = async (userId) => {
+  const [rows] = await pool.execute(
+    `SELECT id, full_name, email, age, gender, country, preferred_language, about_me, 
+            profile_picture_urls, is_premium, created_at
+     FROM users
+     WHERE id = ?
+     LIMIT 1`,
+    [userId]
+  );
+
+  if (!rows.length) {
+    return null;
+  }
+
+  const row = rows[0];
+  return {
+    id: row.id,
+    fullName: row.full_name,
+    email: row.email,
+    age: row.age,
+    gender: row.gender,
+    country: row.country,
+    preferredLanguage: row.preferred_language,
+    aboutMe: row.about_me,
+    profilePictureUrls: row.profile_picture_urls,
+    isPremium: row.is_premium,
+    createdAt: row.created_at
+  };
+};
+
 const recordUsage = async ({ sessionId, userId, llmIn, llmOut, ttsChars, latencyMs }) => {
   await pool.execute(
     `INSERT INTO usage_logs
@@ -246,5 +276,6 @@ module.exports = {
   getLatestMemorySummary,
   saveMemoryEntry,
   getMemoryEntries,
-  fetchMessagesAfterId
+  fetchMessagesAfterId,
+  getUserById
 };
