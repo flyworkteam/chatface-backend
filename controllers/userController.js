@@ -2,6 +2,19 @@ const { pool } = require("../config/database");
 const { uploadBuffer } = require("../utils/bunny");
 const sharp = require("sharp");
 
+const PREMIUM_WELCOME_DURATION_MS = 2 * 24 * 60 * 60 * 1000;
+
+const calculateWelcomePremiumEndTime = (premiumEndtime) => {
+  const now = new Date();
+  const existingPremiumEndTime = premiumEndtime ? new Date(premiumEndtime) : null;
+
+  if (existingPremiumEndTime && existingPremiumEndTime > now) {
+    return new Date(existingPremiumEndTime.getTime() + PREMIUM_WELCOME_DURATION_MS);
+  }
+
+  return new Date(now.getTime() + PREMIUM_WELCOME_DURATION_MS);
+};
+
 const normalizeProfilePictureUrls = (value) => {
   if (!value) return [];
   if (Array.isArray(value)) return value.filter((url) => typeof url === "string" && url.trim());
@@ -289,6 +302,26 @@ const savePreferences = async (req, res, next) => {
     const preferredLanguageValue = preferred_language;
     const fullNameValue = full_name;
 
+    const [users] = await connection.execute(
+      "SELECT onboarding_completed, premium_endtime FROM users WHERE id = ? FOR UPDATE",
+      [userId],
+    );
+
+    if (users.length === 0) {
+      await connection.rollback();
+
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const userData = users[0];
+    const shouldGrantWelcomePremium = !userData.onboarding_completed;
+    const welcomePremiumEndTime = shouldGrantWelcomePremium
+      ? calculateWelcomePremiumEndTime(userData.premium_endtime)
+      : null;
+
     const userUpdates = ["onboarding_completed = 1"];
     const userValues = [];
 
@@ -312,6 +345,12 @@ const savePreferences = async (req, res, next) => {
       userValues.push(gender);
     }
 
+    if (shouldGrantWelcomePremium) {
+      userUpdates.push("is_premium = 1");
+      userUpdates.push("premium_endtime = ?");
+      userValues.push(welcomePremiumEndTime);
+    }
+
     userValues.push(userId);
 
     await connection.execute(
@@ -323,7 +362,14 @@ const savePreferences = async (req, res, next) => {
 
     res.json({
       success: true,
-      message: "Preferences saved successfully",
+      message: shouldGrantWelcomePremium
+        ? "Preferences saved successfully. 2 days of premium added."
+        : "Preferences saved successfully",
+      data: {
+        onboardingCompleted: true,
+        premiumGranted: shouldGrantWelcomePremium,
+        premiumEndTime: welcomePremiumEndTime,
+      },
     });
   } catch (error) {
     await connection.rollback();
