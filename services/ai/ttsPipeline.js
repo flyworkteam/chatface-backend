@@ -5,7 +5,7 @@ const {
 } = require('../../config/elevenlabs');
 
 // Phase 3: route TTS through n8n when USE_N8N_TTS=true
-const USE_N8N_TTS = process.env.USE_N8N_TTS === 'true';
+const USE_N8N_TTS = false;
 const synthesizeSentence = USE_N8N_TTS ? synthesizeSentenceViaN8n : synthesizeSentenceDirect;
 const {
   buildCacheKey,
@@ -238,18 +238,18 @@ const streamLivePayload = async ({
       },
       onAudioChunk: liveStreamRef
         ? (chunk) => {
-            if (!liveStreamRef.firstProviderChunkLogged) {
-              liveStreamRef.firstProviderChunkLogged = true;
-              log('Voice turn first ElevenLabs audio bytes received', {
-                playbackId,
-                sequence,
-                stageSec: elapsedSec(ttsStartedAt),
-                turnSec: elapsedSec(turnStartedAt),
-                byteLength: chunk.length
-              });
-            }
-            appendLiveTtsStream(liveStreamRef.id, chunk);
+          if (!liveStreamRef.firstProviderChunkLogged) {
+            liveStreamRef.firstProviderChunkLogged = true;
+            log('Voice turn first ElevenLabs audio bytes received', {
+              playbackId,
+              sequence,
+              stageSec: elapsedSec(ttsStartedAt),
+              turnSec: elapsedSec(turnStartedAt),
+              byteLength: chunk.length
+            });
           }
+          appendLiveTtsStream(liveStreamRef.id, chunk);
+        }
         : undefined
     });
     if (liveStreamRef) {

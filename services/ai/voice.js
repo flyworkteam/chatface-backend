@@ -22,7 +22,7 @@ const parseOptionalBoolean = (value) => {
 };
 
 const buildVoiceConfig = (voiceRow, language = DEFAULT_LANGUAGE) => {
-  const voiceId = voiceRow?.elevenlabs_voice_id || process.env.ELEVENLABS_DEFAULT_VOICE;
+  const voiceId = voiceRow?.elevenlabs_voice_id;
   if (!voiceId) {
     throw new Error('No ElevenLabs voice configured for persona');
   }

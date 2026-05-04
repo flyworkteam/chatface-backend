@@ -15,9 +15,7 @@ function resolveElevenLabsConfig({ voiceId, modelId }) {
       { recoverable: false }
     );
   }
-  const resolvedVoiceId = voiceId
-    || process.env.ELEVENLABS_DEFAULT_VOICE_ID
-    || process.env.ELEVENLABS_DEFAULT_VOICE;
+  const resolvedVoiceId = voiceId;
   if (!resolvedVoiceId) {
     throw new VoiceStreamError(
       'ELEVENLABS_VOICE_ID_MISSING',
